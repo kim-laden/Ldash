@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import json
 import mimetypes
-import queue
 import secrets
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -25,8 +25,52 @@ if not (WEB / "index.html").exists():
         WEB = alt
 
 TOKEN = secrets.token_hex(16)
+BOOT_ID = secrets.token_hex(4)
 HOST = Host()
-CONTROL: queue.Queue[str] = queue.Queue()
+
+
+class ControlEvents:
+    """Events for the shell's /ctl long poll (hide, quit, drag).
+
+    A shell that passes ?after=<id> (macOS) gets the first event newer than id
+    and the event is not consumed, so a poll the shell already gave up on (it
+    timed out while the backend was busy or napped) can never swallow it.
+    A shell without ?after= (Windows) keeps the old take-once behaviour.
+    """
+
+    def __init__(self, keep: int = 64) -> None:
+        self._cond = threading.Condition()
+        self._events: list[tuple[int, str]] = []
+        self._next = 1
+        self._legacy = 0
+        self._keep = keep
+
+    def put(self, name: str) -> int:
+        with self._cond:
+            event_id = self._next
+            self._next += 1
+            self._events.append((event_id, name))
+            del self._events[:-self._keep]
+            self._cond.notify_all()
+            return event_id
+
+    def wait(self, after: int | None, timeout: float) -> tuple[int, str]:
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while True:
+                cursor = self._legacy if after is None else after
+                for event_id, name in self._events:
+                    if event_id > cursor:
+                        if after is None:
+                            self._legacy = event_id
+                        return event_id, name
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return cursor, "timeout"
+                self._cond.wait(left)
+
+
+CONTROL = ControlEvents()
 MAX_BODY = 14_000_000
 
 BRIDGE = """<script>
@@ -210,14 +254,18 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 self._send(403, b"{}", "application/json")
                 return
+            raw_after = parse_qs(urlparse(self.path).query).get("after", [""])[0]
+            after = int(raw_after) if raw_after.isdigit() else None
+            event_id, event = CONTROL.wait(after, 20)
+            payload = json.dumps({"event": event, "id": event_id, "boot": BOOT_ID}).encode("utf-8")
             try:
-                event = CONTROL.get(timeout=20)
-            except queue.Empty:
-                event = "timeout"
-            payload = json.dumps({"event": event}).encode("utf-8")
-            self._send(200, payload, "application/json")
+                self._send(200, payload, "application/json")
+            except OSError:
+                return  # the shell gave up on this poll; the event stays for its next one
             if event == "quit":
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                # Give the shell's live poll a moment to get it too; the shell
+                # also stops this process when it quits.
+                threading.Timer(1.0, self.server.shutdown).start()
             return
         dest = safe_file(self.path)
         if dest is None:
@@ -261,11 +309,16 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, json.dumps(result).encode("utf-8"), "application/json")
 
 
-def parent_watchdog(parent_pid: int, interval: float = 2.0, getppid=None, alive=None, stop=None) -> None:
+def parent_watchdog(parent_pid: int, interval: float = 1.0, getppid=None, alive=None, stop=None,
+                    misses: int = 2, log=None) -> None:
     """Exit when the shell that started us is gone (crash, SIGKILL, force quit).
 
-    POSIX only. Checks every `interval` seconds: our parent pid changed (we were
-    reparented to launchd/init, pid 1) or the parent pid no longer exists.
+    POSIX only. Checks every `interval` seconds whether our parent pid changed
+    (we were reparented to launchd/init, pid 1) or no longer exists. Lenient:
+    it takes `misses` bad checks in a row (about 2 s) before exiting, and a
+    check that errors or a long sleep (App Nap, a suspended laptop) never counts
+    as "the shell is gone" by itself. A hidden window is not a reason to exit:
+    the watchdog only looks at the process, never at the UI.
     """
     import os
     import time
@@ -281,12 +334,29 @@ def parent_watchdog(parent_pid: int, interval: float = 2.0, getppid=None, alive=
             return True
         return True
 
+    def _log(msg: str) -> None:
+        try:
+            print(f"watchdog: {msg}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
     alive = alive or _alive
+    log = log or _log
     stop = stop or (lambda: os._exit(0))
+    bad = 0
     while True:
         time.sleep(interval)
-        ppid = getppid()
-        if ppid == 1 or ppid != parent_pid or not alive(parent_pid):
+        try:
+            ppid = getppid()
+            gone = ppid == 1 or ppid != parent_pid or not alive(parent_pid)
+        except Exception:  # noqa: BLE001 - an odd check result is not proof the shell is gone
+            continue
+        if not gone:
+            bad = 0
+            continue
+        bad += 1
+        if bad >= max(1, misses):
+            log(f"shell pid {parent_pid} is gone (ppid now {ppid}); backend exiting")
             stop()
             return
 

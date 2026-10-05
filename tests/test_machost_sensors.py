@@ -139,20 +139,137 @@ class TempsTests(unittest.TestCase):
         warm.join(5)
         self.assertEqual(s.temps(), (50.0, 51.0))
 
-    def test_hung_read_drops_method_then_reprobes_later(self):
+    def test_one_slow_read_under_load_keeps_method_and_value(self):
+        # Heavy load: one native read takes longer than TIMEOUT_S. v4 dropped the
+        # method for REPROBE_AFTER_S (60 s), so nulls appeared once the 10 s hold ran out.
         clock = FakeClock()
         reader = ScriptedSMC({"TC0E": [66.0], "TCGC": [67.0]})
         s = intel(reader, clock=clock)
         self.assertEqual(s.temps(), (66.0, 67.0))
-        reader.delay = 1.0  # longer than TIMEOUT_S: looks hung
-        self.assertEqual(s.temps(), (66.0, 67.0))  # held value while it hangs
-        self.assertEqual(s.method, "none")
+        reader.delay = 0.6  # longer than TIMEOUT_S (0.3)
+        self.assertEqual(s.temps(), (66.0, 67.0))  # held
+        self.assertEqual(s.method, "smc")  # one slow read is not a hang
+        clock.advance(2)
+        self.assertEqual(s.temps(), (66.0, 67.0))  # read still in flight: busy, held, no second thread
+        s._inflight.join(2)
         reader.delay = 0.0
-        clock.advance(20)
-        self.assertEqual(s.temps(), (None, None))  # hold expired, no re-probe yet
-        clock.advance(machost.MacSensors.REPROBE_AFTER_S)
+        reader.scripts = {"TC0E": [58.0], "TCGC": [59.0]}
+        clock.advance(15)  # past HOLD_S: v4 would have returned (None, None) here
+        self.assertEqual(s.temps(), (58.0, 59.0))
+        self.assertEqual(s._timeouts, 0)
+
+    def test_slow_read_that_finishes_late_refreshes_the_hold(self):
+        clock = FakeClock()
+        reader = ScriptedSMC({"TC0E": [66.0], "TCGC": [67.0]})
+        s = intel(reader, clock=clock)
+        s.temps()
+        reader.scripts = {"TC0E": [61.5], "TCGC": [62.5]}
+        reader.delay = 0.5
+        self.assertEqual(s.temps(), (66.0, 67.0))  # timed out, held
+        s._inflight.join(2)  # ... but it finished late
+        self.assertEqual(s._last["cpu"][0], 61.5)
+        self.assertEqual(s._last["gpu"][0], 62.5)
+
+    def test_load_miss_is_held_for_load_hold_window(self):
+        clock = FakeClock()
+        reader = ScriptedSMC({"TC0E": [66.0], "TCGC": [67.0]})
+        s = intel(reader, clock=clock)
+        s.temps()
+        hold = threading.Event()
+        s._inflight = threading.Thread(target=hold.wait, daemon=True)  # a read stuck in flight
+        s._inflight.start()
+        s._inflight_at = clock()
+        s.MAX_TIMEOUTS = 1000  # keep the method; test only the hold window
+        clock.advance(25)  # > HOLD_S, < LOAD_HOLD_S
+        self.assertEqual(s.temps(), (66.0, 67.0))
+        clock.advance(machost.MacSensors.LOAD_HOLD_S)
+        self.assertEqual(s.temps(), (None, None))
+        hold.set()
+
+    def test_really_hung_method_dropped_then_reprobed_soon(self):
+        clock = FakeClock()
+        reader = ScriptedSMC({"TC0E": [66.0], "TCGC": [67.0]})
+        s = intel(reader, clock=clock)
+        self.assertEqual(s.temps(), (66.0, 67.0))
+        reader.delay = 1.0  # looks hung
         self.assertEqual(s.temps(), (66.0, 67.0))
         self.assertEqual(s.method, "smc")
+        clock.advance(5)  # the same read is still stuck after > TIMEOUT_S * MAX_TIMEOUTS
+        self.assertEqual(s.temps(), (66.0, 67.0))
+        self.assertEqual(s.method, "none")
+        reader.delay = 0.0
+        clock.advance(4)  # waiting for the re-probe: still held (load gap), not null
+        self.assertEqual(s.temps(), (66.0, 67.0))
+        clock.advance(machost.MacSensors.REPROBE_AFTER_HANG_S)
+        self.assertEqual(s.temps(), (66.0, 67.0))
+        self.assertEqual(s.method, "smc")
+
+    def test_consecutive_timeouts_count_as_hang(self):
+        clock = FakeClock()
+        reader = ScriptedSMC({"TC0E": [66.0], "TCGC": [67.0]})
+        s = intel(reader, clock=clock)
+        s.TIMEOUT_S = 0.05
+        s.temps()
+        reader.delay = 0.12
+        reader.scripts = {"TC0E": [None], "TCGC": [None]}  # slow AND empty: not just load
+        for _ in range(machost.MacSensors.MAX_TIMEOUTS):
+            self.assertEqual(s.temps(), (66.0, 67.0))
+            s._inflight.join(1)
+        self.assertEqual(s.method, "none")
+
+    def test_error_inside_temps_returns_held_value_not_null(self):
+        clock = FakeClock()
+        reader = ScriptedSMC({"TC0E": [66.0], "TCGC": [67.0]})
+        s = intel(reader, clock=clock)
+        s.temps()
+        clock.advance(20)
+        with mock.patch.object(machost._threading.Thread, "start", side_effect=RuntimeError("can't start new thread")):
+            self.assertEqual(s.temps(), (66.0, 67.0))
+
+    def test_heavy_concurrent_load_gives_no_nulls(self):
+        # Scaled version of the 20 s heavy-load run: 8 callers, 3% of native
+        # reads stall past TIMEOUT_S, 5% answer without a value.
+        import random
+
+        rnd = random.Random(7)
+
+        class LoadSMC:
+            def read(self, key):
+                time.sleep(0.25 if rnd.random() < 0.03 else 0.002)
+                return None if rnd.random() < 0.05 else 60.0
+
+            def close(self):
+                pass
+
+        sensors = machost.MacSensors(machine="x86_64", smc_factory=LoadSMC, hid_factory=mock.Mock(side_effect=OSError),
+                                     runner=mock.Mock(return_value='"Device Utilization %"=5'))
+        sensors.TIMEOUT_S = 0.1
+        sensors.HOLD_S, sensors.LOAD_HOLD_S = 1.0, 4.5
+        sensors.REPROBE_AFTER_S, sensors.REPROBE_AFTER_HANG_S = 6.0, 1.0
+        machost._SAMPLE["at"] = None
+        nulls, total = [], []
+        end = time.monotonic() + 1.5
+        with mock.patch.object(machost, "_mac_sensors", return_value=sensors), \
+                mock.patch.object(machost.shutil, "which", return_value=None), \
+                mock.patch.object(machost, "SAMPLE_MAX_AGE_S", 0.01):
+            sensors.temps()
+
+            def caller():
+                while time.monotonic() < end:
+                    cpu, _pct, gpu = machost._sample_temps_and_gpu()
+                    total.append(1)
+                    if cpu is None or gpu is None:
+                        nulls.append(1)
+                    time.sleep(0.003)
+
+            threads = [threading.Thread(target=caller) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        self.assertGreater(len(total), 100)
+        self.assertEqual(len(nulls), 0)
+        self.assertEqual(sensors.method, "smc")
 
     def test_nothing_works_stays_none_without_errors(self):
         s = machost.MacSensors(
@@ -193,6 +310,16 @@ class GpuUtilTests(unittest.TestCase):
         s = intel(ScriptedSMC({}), clock=clock, runner=runner)
         self.assertEqual(s.gpu_util(), 12.0)
         clock.advance(3)
+        self.assertEqual(s.gpu_util(), 12.0)
+        self.assertTrue(s._util_ok)
+
+    def test_util_timeout_under_load_is_held_longer(self):
+        clock = FakeClock()
+        slow = machost.subprocess.TimeoutExpired("ioreg", 2)
+        runner = mock.Mock(side_effect=[self.IOREG] + [slow] * 4)
+        s = intel(ScriptedSMC({}), clock=clock, runner=runner)
+        self.assertEqual(s.gpu_util(), 12.0)
+        clock.advance(25)  # > HOLD_S: ioreg only timed out, keep the value
         self.assertEqual(s.gpu_util(), 12.0)
         self.assertTrue(s._util_ok)
 
@@ -326,7 +453,7 @@ class WatchdogTests(unittest.TestCase):
 
         cls.serve = serve
 
-    def run_watchdog(self, ppids, alive=True):
+    def run_watchdog(self, ppids, alive=True, misses=2):
         seq = iter(ppids)
         stopped = []
         with mock.patch("time.sleep"):
@@ -336,18 +463,63 @@ class WatchdogTests(unittest.TestCase):
                 getppid=lambda: next(seq),
                 alive=(lambda pid: alive) if not callable(alive) else alive,
                 stop=lambda: stopped.append(True),
+                misses=misses,
+                log=lambda _m: None,
             )
         return stopped
 
     def test_exits_when_reparented_to_launchd(self):
-        self.assertEqual(self.run_watchdog([4242, 4242, 1]), [True])
+        self.assertEqual(self.run_watchdog([4242, 4242, 1, 1]), [True])
 
     def test_exits_when_parent_pid_changes(self):
-        self.assertEqual(self.run_watchdog([4242, 777]), [True])
+        self.assertEqual(self.run_watchdog([4242, 777, 777]), [True])
 
     def test_exits_when_parent_is_gone(self):
-        calls = iter([True, True, False])
+        calls = iter([True, True, False, False])
         self.assertEqual(self.run_watchdog([4242] * 5, alive=lambda pid: next(calls)), [True])
+
+    def test_one_odd_check_does_not_kill_the_backend(self):
+        # A single bad or failing check (e.g. after App Nap) is not enough.
+        calls = iter([True, False, True, True, False, False])
+        self.assertEqual(self.run_watchdog([4242] * 6, alive=lambda pid: next(calls)), [True])
+
+        def flaky(pid, state={"n": 0}):
+            state["n"] += 1
+            if state["n"] == 2:
+                raise OSError("EAGAIN")
+            return state["n"] < 5
+
+        stopped = self.run_watchdog([4242] * 8, alive=flaky)
+        self.assertEqual(stopped, [True])
+
+    def test_stops_within_about_two_seconds_by_default(self):
+        import inspect
+
+        sig = inspect.signature(self.serve.parent_watchdog)
+        self.assertLessEqual(sig.parameters["interval"].default * sig.parameters["misses"].default, 2.0)
+
+    def test_control_events_are_not_lost_to_an_abandoned_poll(self):
+        events = self.serve.ControlEvents()
+        got = []
+        # A poll the shell already gave up on (timed out) is still waiting server-side.
+        stale = threading.Thread(target=lambda: got.append(events.wait(0, 2)))
+        stale.start()
+        time.sleep(0.05)
+        hide_id = events.put("hide")
+        stale.join(2)
+        # The live poll (same ?after=0) still gets the hide.
+        self.assertEqual(events.wait(0, 0.1), (hide_id, "hide"))
+        self.assertEqual(events.wait(hide_id, 0.05), (hide_id, "timeout"))
+        quit_id = events.put("quit")
+        self.assertEqual(events.wait(hide_id, 0.1), (quit_id, "quit"))
+
+    def test_control_events_legacy_poll_takes_each_event_once(self):
+        events = self.serve.ControlEvents()
+        events.put("hide")
+        events.put("quit")
+        self.assertEqual(events.wait(None, 0.1)[1], "hide")
+        self.assertEqual(events.wait(None, 0.1)[1], "quit")
+        self.assertEqual(events.wait(None, 0.05)[1], "timeout")
 
     def test_only_started_with_parent_pid_on_posix(self):
         with mock.patch.dict("os.environ", {}, clear=False):

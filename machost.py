@@ -691,17 +691,27 @@ class MacSensors:
     - Reads are serialized: a second caller waits for the read in flight
       instead of getting None back.
     - Each call retries the cached method a few times before giving up.
-    - A transient miss returns the last good value for HOLD_S seconds.
-    - A hung native call drops the method; it is re-probed later, a few times.
+    - A sensor that answers without a value: the last good value is held for
+      HOLD_S seconds.
+    - A read we could not finish in time (slow native call under heavy load,
+      a read still in flight, re-probing, lock contention, an exception): the
+      last good value is held for LOAD_HOLD_S seconds. A slow read that ends
+      late still refreshes the held value.
+    - Only MAX_TIMEOUTS slow reads in a row (or one stuck for longer than that)
+      count as a hung method; it is then re-probed after REPROBE_AFTER_HANG_S.
+      One slow read under load no longer drops a working method for a minute.
     """
 
     TIMEOUT_S = 2.0
     MAX_FAILS = 3
     HOLD_S = 10.0
+    LOAD_HOLD_S = 45.0
     RETRIES = 3
     RETRY_DELAY_S = 0.05
     REPROBE_AFTER_S = 60.0
-    MAX_PROBES = 5
+    REPROBE_AFTER_HANG_S = 10.0
+    MAX_TIMEOUTS = 3
+    MAX_PROBES = 8
 
     def __init__(self, machine: str | None = None, hid_factory=None, smc_factory=None, runner=None,
                  ioreg: str | None = "/usr/sbin/ioreg", clock=None, sleep=None) -> None:
@@ -724,6 +734,9 @@ class MacSensors:
         self.smc_gpu_key: str | None = None
         self._expect = {"cpu": False, "gpu": False}
         self._fails = 0
+        self._timeouts = 0
+        self._inflight: _threading.Thread | None = None
+        self._inflight_at = 0.0
         self._last: dict[str, tuple[float | None, float]] = {"cpu": (None, 0.0), "gpu": (None, 0.0), "util": (None, 0.0)}
         self._util_ok = True
         self._util_seen = False
@@ -777,6 +790,8 @@ class MacSensors:
         self._probes += 1
         self._next_probe_at = self._clock() + self.REPROBE_AFTER_S
         self.method, self.reader = "none", None
+        self._timeouts = 0
+        self._inflight = None
         order = (self._try_hid, self._try_smc) if self.apple_silicon else (self._try_smc, self._try_hid)
         for attempt in order:
             try:
@@ -803,20 +818,68 @@ class MacSensors:
                 if value is not None:
                     self._last[kind] = (value, self._clock())
 
-    def _hold(self, kind: str, value: float | None) -> float | None:
-        """Remember a good value, or return the last good one for HOLD_S seconds."""
+    def _hold(self, kind: str, value: float | None, hold_s: float | None = None) -> float | None:
+        """Remember a good value, or return the last good one for hold_s (default HOLD_S) seconds."""
         now = self._clock()
         if value is not None:
             self._last[kind] = (value, now)
             return value
         last, at = self._last[kind]
-        if last is not None and now - at <= self.HOLD_S:
+        if last is not None and now - at <= (self.HOLD_S if hold_s is None else hold_s):
             return last
         return None
 
-    def _held(self, cpu: float | None, gpu: float | None) -> tuple[float | None, float | None]:
+    def _held(self, cpu: float | None, gpu: float | None, load: bool = False) -> tuple[float | None, float | None]:
+        hold_s = self.LOAD_HOLD_S if load else self.HOLD_S
         with self._lock:
-            return self._hold("cpu", cpu), self._hold("gpu", gpu)
+            return self._hold("cpu", cpu, hold_s), self._hold("gpu", gpu, hold_s)
+
+    def _late(self, value) -> None:
+        """A read that timed out finished after all: keep its values fresh."""
+        try:
+            cpu, gpu = value if value else (None, None)
+            self._seed(cpu, gpu)
+            if _valid_temp(cpu) is not None or _valid_temp(gpu) is not None:
+                self._timeouts = 0
+        except Exception:
+            pass
+
+    def _timed_read(self) -> tuple[str, tuple | None]:
+        """One native read with TIMEOUT_S. Returns ("ok"|"timeout"|"busy", value).
+
+        Never starts a second native read while an earlier one is still stuck.
+        """
+        if self._inflight is not None and self._inflight.is_alive():
+            return "busy", None
+        box: dict = {}
+        box_lock = _threading.Lock()
+
+        def run() -> None:
+            try:
+                value = self._read_once()
+            except Exception:  # noqa: BLE001 - every failure means "no reading"
+                value = None
+            with box_lock:
+                box["value"] = value
+                late = box.get("late", False)
+            if late:
+                self._late(value)
+
+        worker = _threading.Thread(target=run, name="ldash-sensor", daemon=True)
+        self._inflight, self._inflight_at = worker, self._clock()
+        worker.start()
+        worker.join(self.TIMEOUT_S)
+        with box_lock:
+            if "value" in box:
+                self._inflight = None
+                return "ok", box["value"]
+            box["late"] = True
+        return "timeout", None
+
+    def _drop_hung_method(self) -> None:
+        self.method = "none"
+        self._timeouts = 0
+        self._next_probe_at = self._clock() + self.REPROBE_AFTER_HANG_S
 
     def _wants_probe(self) -> bool:
         if not self._probed:
@@ -824,18 +887,27 @@ class MacSensors:
         return (self.method == "none" and self._probes < self.MAX_PROBES
                 and self._clock() >= self._next_probe_at)
 
-    def _read_with_retry(self) -> tuple[float | None, float | None]:
+    def _read_with_retry(self) -> tuple[float | None, float | None, bool]:
+        """(cpu, gpu, load_miss). load_miss: no read finished in time."""
         cpu = gpu = None
+        load_miss = False
         for attempt in range(self.RETRIES):
             if self.method == "none":
                 break
-            done, value = _call_with_timeout(self._read_once, self.TIMEOUT_S)
-            if not done:
-                # A native call hung. Stop using this method instead of piling up
-                # threads; a later call re-probes after REPROBE_AFTER_S.
-                self.method = "none"
-                self._next_probe_at = self._clock() + self.REPROBE_AFTER_S
+            status, value = self._timed_read()
+            if status != "ok":
+                load_miss = True
+                stuck_for = self._clock() - self._inflight_at
+                if status == "timeout":
+                    self._timeouts += 1
+                if self._timeouts >= self.MAX_TIMEOUTS or (
+                        status == "busy" and stuck_for > self.TIMEOUT_S * self.MAX_TIMEOUTS):
+                    # Really hung, not just slow: stop using it (no thread pile-up)
+                    # and re-probe soon; the held value covers the gap.
+                    self._drop_hung_method()
+                # Slow under load: keep the method, hold the last value.
                 break
+            self._timeouts = 0
             if value:
                 if cpu is None:
                     cpu = _valid_temp(value[0])
@@ -853,17 +925,28 @@ class MacSensors:
                 self._next_probe_at = self._clock()
         elif cpu is not None or gpu is not None:
             self._fails = 0
-        return cpu, gpu
+        if self.method == "none" and self._probed and not load_miss and cpu is None and gpu is None:
+            # Waiting for a re-probe after a hang: still a "could not read" gap.
+            load_miss = self._next_probe_at > self._clock()
+        return cpu, gpu, load_miss
 
     def temps(self) -> tuple[float | None, float | None]:
         """(cpuTempC, gpuTempC), steady across transient misses."""
+        try:
+            return self._temps()
+        except Exception:
+            # Never let an error (e.g. no thread could be started under load)
+            # bypass the hold and reach the UI as a null.
+            return self._held(None, None, load=True)
+
+    def _temps(self) -> tuple[float | None, float | None]:
         with self._lock:
             probing_elsewhere = self._probing
         if probing_elsewhere:
             # The first probe can take a few seconds; never block an HTTP call on it.
-            return self._held(None, None)
+            return self._held(None, None, load=True)
         if not self._read_lock.acquire(timeout=self.TIMEOUT_S * (self.RETRIES + 1)):
-            return self._held(None, None)
+            return self._held(None, None, load=True)
         try:
             if self._wants_probe():
                 with self._lock:
@@ -875,24 +958,32 @@ class MacSensors:
                 finally:
                     with self._lock:
                         self._probing = False
-            cpu, gpu = self._read_with_retry()
+            cpu, gpu, load_miss = self._read_with_retry()
         finally:
             self._read_lock.release()
-        return self._held(cpu, gpu)
+        return self._held(cpu, gpu, load=load_miss)
 
     def _ioreg_util(self) -> float | None:
+        self._util_slow = False
         try:
             out = self._run([self._ioreg, "-r", "-c", "IOAccelerator", "-d", "1"], text=True, timeout=2, stderr=subprocess.DEVNULL)
             return parse_ioreg_gpu_util(out)
+        except subprocess.TimeoutExpired:
+            self._util_slow = True  # ioreg starved under load, not "no GPU"
+            return None
         except Exception:
             return None
 
     def gpu_util(self) -> float | None:
         if not self._util_ok or not self._ioreg:
             return None
-        util = self._ioreg_util()
-        if util is None:
-            util = self._ioreg_util()  # one quick retry
+        try:
+            util = self._ioreg_util()
+            if util is None:
+                util = self._ioreg_util()  # one quick retry
+            slow = getattr(self, "_util_slow", False)
+        except Exception:
+            util, slow = None, True
         with self._lock:
             if util is None:
                 self._util_fails += 1
@@ -902,7 +993,7 @@ class MacSensors:
             else:
                 self._util_seen = True
                 self._util_fails = 0
-            return self._hold("util", util)
+            return self._hold("util", util, self.LOAD_HOLD_S if slow else None)
 
     def sources(self) -> dict:
         cpu = self.method

@@ -21,7 +21,27 @@ internal static class Program
             return;
         Current = new Shell(config);
         // Never leave serve.py running on 127.0.0.1 when the shell goes away.
-        AppDomain.CurrentDomain.ProcessExit += (_, _) => Current?.KillBackendNow();
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+        {
+            Current?.LogLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} process exit ({Current?.ExitReason ?? "unknown"})");
+            Current?.KillBackendNow();
+        };
+        // A SIGTERM/SIGHUP/SIGINT leaves no crash report: record who ended us.
+        var signals = new List<PosixSignalRegistration>();
+        foreach (var sig in new[] { PosixSignal.SIGTERM, PosixSignal.SIGHUP, PosixSignal.SIGINT })
+        {
+            try
+            {
+                signals.Add(PosixSignalRegistration.Create(sig, ctx =>
+                {
+                    if (Current != null) Current.ExitReason = "signal " + ctx.Signal;
+                    Current?.LogLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} received {ctx.Signal}");
+                }));
+            }
+            catch (Exception)
+            {
+            }
+        }
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         {
             Current?.LogLine("unhandled: " + e.ExceptionObject);
@@ -34,6 +54,7 @@ internal static class Program
         finally
         {
             Current.KillBackendNow();
+            GC.KeepAlive(signals);
         }
     }
 }
@@ -69,6 +90,10 @@ internal sealed class Shell
     private static readonly ReopenHandler ReopenThunk = OnReopen;
     private static readonly BoolIdHandler TerminateAfterLastThunk = OnShouldTerminateAfterLastWindowClosed;
     private static readonly BoolIdHandler ShouldCloseThunk = OnWindowShouldClose;
+    private static readonly MenuActionHandler MenuCloseThunk = OnMenuClose;
+    private static readonly MenuActionHandler MenuQuitThunk = OnMenuQuit;
+    private static IntPtr _menuTarget;
+    private static IntPtr _activity;
     private static IntPtr _nsWindow;
     private static readonly DispatchFn MainThunk = OnMainThunk;
     private static readonly DragHandler DragThunk = OnDrag;
@@ -88,6 +113,7 @@ internal sealed class Shell
     private bool _backendOk;
     private bool _servicesStarted;
     private int _retrying;
+    internal string ExitReason { get; set; } = "window closed";
 
     private sealed record BootResult(bool Ok, string Port, string Token, string Error);
 
@@ -96,6 +122,9 @@ internal sealed class Shell
         // Photino needs StartUrl or StartString before WaitForClose creates the
         // native window. Start the backend first and wait for its PORT/TOKEN
         // lines, then open the window on the real URL, or on an error page.
+        // App Nap off first: a hidden app must keep its control loop, timers and
+        // backend wait running at full speed.
+        DisableAppNap();
         var boot = StartBackendBlocking();
         var window = new PhotinoWindow()
             .SetTitle("Laden Ops")
@@ -118,6 +147,7 @@ internal sealed class Shell
                 {
                     RememberWindow();
                     InstallLifecycle();
+                    InstallMenu();
                     InstallFrame();
                     if (_backendOk) StartServices();
                 }
@@ -163,11 +193,13 @@ internal sealed class Shell
         }
         _window = window;
         window.WaitForClose();
+        Log($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} shell exiting: {ExitReason} (quitting={_quitting}, backendOk={_backendOk})");
         Shutdown();
     }
 
     public void ShowFromOutside()
     {
+        Log($"{DateTime.Now:HH:mm:ss} show (second launch)");
         _pendingShow = true;
         OnMain(ShowPending);
     }
@@ -176,7 +208,8 @@ internal sealed class Shell
     {
         _origin = $"http://127.0.0.1:{boot.Port}";
         _http?.Dispose();
-        _http = new HttpClient { Timeout = TimeSpan.FromSeconds(40) };
+        // Per-request deadlines are set in ControlLoop (the /ctl poll is long).
+        _http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         _http.DefaultRequestHeaders.Add("X-Laden-Token", boot.Token);
         _backendOk = true;
     }
@@ -200,11 +233,7 @@ internal sealed class Shell
         var text = (message ?? "").Trim();
         if (text == "laden:quit")
         {
-            OnMain(() =>
-            {
-                _quitting = true;
-                _window?.Close();
-            });
+            OnMain(() => RequestQuit("error page Quit"));
         }
         else if (text == "laden:retry" && !_backendOk && Interlocked.Exchange(ref _retrying, 1) == 0)
         {
@@ -431,34 +460,60 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
 """;
     }
 
+    // /ctl is a 20 s long poll. Each request gets its own 60 s deadline; a
+    // timeout (slow, napped or busy backend) only retries. In v4 the HttpClient
+    // timeout surfaced as TaskCanceledException, which the loop took for
+    // "shutting down": it returned and the board's Hide/Quit stopped working.
+    // The poll passes ?after=<last event id> so the backend never hands an
+    // event to an abandoned (timed-out) request and loses it.
+    internal static TimeSpan ControlRequestTimeout = TimeSpan.FromSeconds(60);
+
     private async Task ControlLoop(CancellationToken cancel)
     {
+        var failures = 0;
+        long after = 0;
+        string boot = "";
         while (!cancel.IsCancellationRequested && _http != null)
         {
             try
             {
-                using var res = await _http.GetAsync(_origin + "/ctl", cancel);
-                var json = await res.Content.ReadAsStringAsync(cancel);
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancel);
+                deadline.CancelAfter(ControlRequestTimeout);
+                using var res = await _http.GetAsync($"{_origin}/ctl?after={after}", deadline.Token);
+                var json = await res.Content.ReadAsStringAsync(deadline.Token);
+                failures = 0;
                 using var doc = JsonDocument.Parse(json);
-                var ev = doc.RootElement.GetProperty("event").GetString();
-                if (ev == "hide") OnMain(HideWindow);
+                var root = doc.RootElement;
+                var ev = root.GetProperty("event").GetString();
+                if (root.TryGetProperty("boot", out var b) && b.GetString() is { } bootId && bootId != boot)
+                {
+                    // A new backend (Try again) numbers its events from 1 again.
+                    if (boot.Length > 0 && ev == "timeout") after = 0;
+                    boot = bootId;
+                }
+                if (root.TryGetProperty("id", out var id) && id.TryGetInt64(out var eventId) && ev != "timeout")
+                    after = Math.Max(after, eventId);
+                if (ev == "hide")
+                {
+                    Log($"{DateTime.Now:HH:mm:ss} hide (board)");
+                    OnMain(HideWindow);
+                }
                 else if (ev == "quit")
                 {
-                    OnMain(() =>
-                    {
-                        _quitting = true;
-                        _window?.Close();
-                    });
+                    OnMain(() => RequestQuit("board Quit"));
                     return;
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cancel.IsCancellationRequested)
             {
                 return;
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                try { await Task.Delay(400, cancel); }
+                // Includes a request timeout. Keep polling; log the first few.
+                if (++failures <= 3 || failures % 50 == 0)
+                    Log($"{DateTime.Now:HH:mm:ss} control poll: {ex.GetType().Name} ({failures})");
+                try { await Task.Delay(failures > 5 ? 2000 : 400, cancel); }
                 catch (OperationCanceledException) { return; }
             }
         }
@@ -545,7 +600,9 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
 
     private void Toggle()
     {
-        if (IsHidden()) ShowWindow();
+        var hidden = IsHidden();
+        Log($"{DateTime.Now:HH:mm:ss} {(hidden ? "show" : "hide")} (hotkey)");
+        if (hidden) ShowWindow();
         else HideWindow();
     }
 
@@ -652,8 +709,9 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
     {
         try
         {
-            if (Program.Current is { KeepAlive: true })
+            if (Program.Current is { KeepAlive: true } shell)
             {
+                shell.Log($"{DateTime.Now:HH:mm:ss} hide (close button)");
                 HideWindow();
                 return 0;
             }
@@ -662,6 +720,178 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
         {
         }
         return 1;
+    }
+
+    // Board Quit, error page Quit, the /ctl quit event and Cmd+Q all end here.
+    internal void RequestQuit(string source)
+    {
+        MarkQuitting(source);
+        _window?.Close();
+    }
+
+    internal void MarkQuitting(string source)
+    {
+        _quitting = true;
+        ExitReason = source;
+        Log($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} quit requested ({source})");
+    }
+
+    // NSActivityUserInitiatedAllowingIdleSystemSleep: no App Nap and no automatic
+    // or sudden termination while the app runs (also while it is hidden). The Mac
+    // may still sleep. Info.plist sets LSAppNapIsDisabled as well.
+    private const ulong ActivityUserInitiatedAllowingIdleSystemSleep = 0x00FFFFFFUL & ~(1UL << 20);
+
+    private void DisableAppNap()
+    {
+        try
+        {
+            if (_activity != IntPtr.Zero) return;
+            var info = SendId(objc_getClass("NSProcessInfo"), Sel("processInfo"));
+            if (info == IntPtr.Zero) return;
+            var token = objc_msgSend_activity(info, Sel("beginActivityWithOptions:reason:"),
+                ActivityUserInitiatedAllowingIdleSystemSleep, NsString("Laden Ops dashboard and backend"));
+            // The token is autoreleased; keep it for the life of the process.
+            if (token != IntPtr.Zero) _activity = SendId(token, Sel("retain"));
+            Log($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} app nap disabled: {_activity != IntPtr.Zero}");
+        }
+        catch (Exception ex)
+        {
+            Log("app nap: " + ex.Message);
+        }
+    }
+
+    // Standard menu bar: Laden Ops (About, Hide, Hide Others, Show All, Quit),
+    // Edit (copy/paste for the web view) and Window (Minimize, Close). Close
+    // (Cmd+W) hides like the close button; Quit (Cmd+Q) quits like the board.
+    private const nuint ModCommand = 1 << 20;
+    private const nuint ModOption = 1 << 19;
+    private const nuint ModShift = 1 << 17;
+
+    private static void InstallMenu()
+    {
+        try
+        {
+            var app = SharedApp();
+            if (app == IntPtr.Zero) return;
+            var target = MenuTarget();
+            var bar = NewMenu("");
+
+            var appMenu = NewMenu("Laden Ops");
+            AddItem(appMenu, "About Laden Ops", "orderFrontStandardAboutPanel:", "", 0, IntPtr.Zero);
+            AddSeparator(appMenu);
+            AddItem(appMenu, "Hide Laden Ops", "hide:", "h", ModCommand, IntPtr.Zero);
+            AddItem(appMenu, "Hide Others", "hideOtherApplications:", "h", ModCommand | ModOption, IntPtr.Zero);
+            AddItem(appMenu, "Show All", "unhideAllApplications:", "", 0, IntPtr.Zero);
+            AddSeparator(appMenu);
+            AddItem(appMenu, "Quit Laden Ops", "ladenQuit:", "q", ModCommand, target);
+            AddSubmenu(bar, "Laden Ops", appMenu);
+
+            var edit = NewMenu("Edit");
+            AddItem(edit, "Undo", "undo:", "z", ModCommand, IntPtr.Zero);
+            AddItem(edit, "Redo", "redo:", "z", ModCommand | ModShift, IntPtr.Zero);
+            AddSeparator(edit);
+            AddItem(edit, "Cut", "cut:", "x", ModCommand, IntPtr.Zero);
+            AddItem(edit, "Copy", "copy:", "c", ModCommand, IntPtr.Zero);
+            AddItem(edit, "Paste", "paste:", "v", ModCommand, IntPtr.Zero);
+            AddItem(edit, "Select All", "selectAll:", "a", ModCommand, IntPtr.Zero);
+            AddSubmenu(bar, "Edit", edit);
+
+            var window = NewMenu("Window");
+            AddItem(window, "Minimize", "miniaturize:", "m", ModCommand, IntPtr.Zero);  // performMiniaturize: beeps without a title-bar button
+            AddSeparator(window);
+            AddItem(window, "Close", "ladenClose:", "w", ModCommand, target);
+            AddSubmenu(bar, "Window", window);
+
+            Send(app, Sel("setMainMenu:"), bar);
+            Send(app, Sel("setWindowsMenu:"), window);
+        }
+        catch (Exception ex)
+        {
+            Program.Current?.Log("menu: " + ex.Message);
+        }
+    }
+
+    private static IntPtr MenuTarget()
+    {
+        if (_menuTarget != IntPtr.Zero) return _menuTarget;
+        var cls = objc_getClass("LadenMenuTarget");
+        if (cls == IntPtr.Zero)
+        {
+            cls = objc_allocateClassPair(objc_getClass("NSObject"), "LadenMenuTarget", 0);
+            if (cls == IntPtr.Zero) return IntPtr.Zero;
+            class_addMethod(cls, Sel("ladenClose:"), Marshal.GetFunctionPointerForDelegate(MenuCloseThunk), "v@:@");
+            class_addMethod(cls, Sel("ladenQuit:"), Marshal.GetFunctionPointerForDelegate(MenuQuitThunk), "v@:@");
+            objc_registerClassPair(cls);
+        }
+        // Never released: the menu items only hold a weak reference to their target.
+        _menuTarget = SendId(SendId(cls, Sel("alloc")), Sel("init"));
+        return _menuTarget;
+    }
+
+    private static IntPtr NewMenu(string title) =>
+        SendPtr(SendId(objc_getClass("NSMenu"), Sel("alloc")), Sel("initWithTitle:"), NsString(title));
+
+    private static IntPtr AddItem(IntPtr menu, string title, string? action, string key, nuint mods, IntPtr target)
+    {
+        var item = objc_msgSend_id3(SendId(objc_getClass("NSMenuItem"), Sel("alloc")),
+            Sel("initWithTitle:action:keyEquivalent:"), NsString(title),
+            action == null ? IntPtr.Zero : Sel(action), NsString(key));
+        if (item == IntPtr.Zero) return IntPtr.Zero;
+        if (key.Length > 0) SendNUInt(item, Sel("setKeyEquivalentModifierMask:"), mods);
+        if (target != IntPtr.Zero) Send(item, Sel("setTarget:"), target);
+        Send(menu, Sel("addItem:"), item);
+        return item;
+    }
+
+    private static void AddSeparator(IntPtr menu) =>
+        Send(menu, Sel("addItem:"), SendId(objc_getClass("NSMenuItem"), Sel("separatorItem")));
+
+    private static void AddSubmenu(IntPtr bar, string title, IntPtr submenu)
+    {
+        var item = AddItem(bar, title, null, "", 0, IntPtr.Zero);
+        if (item != IntPtr.Zero) Send(item, Sel("setSubmenu:"), submenu);
+    }
+
+    // Window > Close (Cmd+W): hide while the board is up, like the close button.
+    private static void OnMenuClose(IntPtr self, IntPtr cmd, IntPtr sender)
+    {
+        try
+        {
+            var shell = Program.Current;
+            if (shell is { KeepAlive: true })
+            {
+                shell.Log($"{DateTime.Now:HH:mm:ss} hide (Cmd+W)");
+                HideWindow();
+            }
+            else
+            {
+                shell?.RequestQuit("Cmd+W on the error page");
+            }
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    // Quit (Cmd+Q): mark the quit (so nothing turns it into a hide), then
+    // terminate: exactly like Photino's own Quit item did in v4.
+    private static void OnMenuQuit(IntPtr self, IntPtr cmd, IntPtr sender)
+    {
+        try
+        {
+            Program.Current?.MarkQuitting("Cmd+Q");
+        }
+        catch (Exception)
+        {
+        }
+        try
+        {
+            var app = SharedApp();
+            if (app != IntPtr.Zero) Send(app, Sel("terminate:"), IntPtr.Zero);
+        }
+        catch (Exception)
+        {
+        }
     }
 
     // WKWebView ignores app-region, and a drag started after the HTTP round trip
@@ -797,6 +1027,7 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
     {
         try
         {
+            Program.Current?.Log($"{DateTime.Now:HH:mm:ss} show (Dock)");
             ShowWindow();
         }
         catch (Exception)
@@ -1070,6 +1301,7 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
     private delegate int CarbonHandler(IntPtr next, IntPtr evt, IntPtr user);
     private delegate byte ReopenHandler(IntPtr self, IntPtr cmd, IntPtr app, byte hasVisible);
     private delegate byte BoolIdHandler(IntPtr self, IntPtr cmd, IntPtr arg);
+    private delegate void MenuActionHandler(IntPtr self, IntPtr cmd, IntPtr sender);
     private delegate void DispatchFn(IntPtr ctx);
     private delegate void DragHandler(IntPtr self, IntPtr cmd, IntPtr evt);
     private delegate byte AcceptHandler(IntPtr self, IntPtr cmd, IntPtr evt);
@@ -1141,6 +1373,12 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
 
     [DllImport(ObjC, EntryPoint = "objc_msgSend")]
     private static extern IntPtr objc_msgSend_format(IntPtr recv, IntPtr sel, IntPtr format, nuint options, IntPtr metrics, IntPtr views);
+
+    [DllImport(ObjC, EntryPoint = "objc_msgSend")]
+    private static extern IntPtr objc_msgSend_id3(IntPtr recv, IntPtr sel, IntPtr a, IntPtr b, IntPtr c);
+
+    [DllImport(ObjC, EntryPoint = "objc_msgSend")]
+    private static extern IntPtr objc_msgSend_activity(IntPtr recv, IntPtr sel, ulong options, IntPtr reason);
 
     [DllImport(ObjC, EntryPoint = "objc_allocateClassPair")]
     private static extern IntPtr objc_allocateClassPair(IntPtr superclass, string name, nuint extraBytes);
