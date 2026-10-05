@@ -31,14 +31,18 @@ html[data-accent="code"] {
 }
 
 * { box-sizing: border-box; }
-html, body { height: 100%; background-color: transparent; }
+/* Opaque page chrome — transparent html/body + soft overlays band badly over RustDesk. */
+html, body {
+  height: 100%;
+  background-color: var(--bg);
+  background-image: none;
+}
 body {
   margin: 0;
   color: var(--text);
   font-family: "IBM Plex Sans", system-ui, sans-serif;
-  background:
-    radial-gradient(900px 420px at 10% -10%, rgba(var(--green-rgb), 0.08), transparent 55%),
-    linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
+  background-color: var(--bg);
+  background-image: linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -47,31 +51,28 @@ body {
   clip-path: inset(0 round 18px);
   color-scheme: dark;
 }
-body::before {
-  content: "";
-  pointer-events: none;
-  position: fixed;
-  inset: 0;
+/* Soft local wash only — scanlines/grid removed (they band over remote codecs). */
+html:not([data-remote="1"]) body {
   background-image:
-    linear-gradient(rgba(26, 35, 50, 0.45) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(26, 35, 50, 0.45) 1px, transparent 1px);
-  background-size: 48px 48px;
-  mask-image: linear-gradient(180deg, #000 0%, transparent 88%);
-  opacity: 0.45;
+    radial-gradient(900px 420px at 10% -10%, rgba(var(--green-rgb), 0.06), transparent 55%),
+    linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
 }
+body::before,
 .scan {
+  display: none !important;
+  content: none !important;
+  background: none !important;
+  opacity: 0 !important;
+  mask-image: none !important;
   pointer-events: none;
-  position: fixed;
-  inset: 0;
-  background: repeating-linear-gradient(
-    to bottom,
-    rgba(0, 0, 0, 0.08) 0px,
-    rgba(0, 0, 0, 0.08) 1px,
-    transparent 2px,
-    transparent 4px
-  );
-  opacity: 0.35;
-  z-index: 8;
+}
+/* Remoting-friendly: solid fills, no soft glow wash. */
+html[data-remote="1"] {
+  --glow: none;
+}
+html[data-remote="1"] body {
+  background-color: var(--bg);
+  background-image: none;
 }
 .mono { font-family: "JetBrains Mono", ui-monospace, monospace; }
 
@@ -141,7 +142,7 @@ h1 em { color: var(--green); font-style: normal; }
   border: 1px dashed rgba(var(--green-rgb), 0.45);
   color: var(--green);
   font-size: 13px;
-  background: rgba(8, 12, 18, 0.92);
+  background: var(--bg2);
 }
 .edit-banner[hidden] { display: none; }
 
@@ -163,7 +164,7 @@ h1 em { color: var(--green); font-style: normal; }
 body.layout-edit .board { padding-top: 78px; }
 
 .widget {
-  background: rgba(12, 16, 23, 0.92);
+  background: var(--panel);
   border: 1px solid rgba(var(--green-rgb), 0.16);
   border-radius: var(--radius);
   box-shadow: var(--glow);
@@ -172,6 +173,10 @@ body.layout-edit .board { padding-top: 78px; }
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+}
+html[data-remote="1"] .widget {
+  background: var(--panel);
+  box-shadow: none;
 }
 .widget.lifted {
   position: absolute;
@@ -265,7 +270,7 @@ body.is-pushing, body.is-pushing * { cursor: grabbing !important; }
 .app-btn span { color: var(--muted); font-size: 11px; }
 .app-btn:hover { border-color: var(--app, var(--green)); box-shadow: 0 0 18px rgba(var(--green-rgb), 0.12); }
 
-.metric { margin-bottom: 8px; padding: 8px; border-radius: 10px; background: rgba(16, 23, 34, 0.7); border: 1px solid var(--border); }
+.metric { margin-bottom: 8px; padding: 8px; border-radius: 10px; background: var(--panel2); border: 1px solid var(--border); }
 .metric-head, .row { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
 .metric .label, .muted { color: var(--muted); font-size: 12px; }
 .metric .value { font-family: "JetBrains Mono", monospace; color: var(--green); }
@@ -579,11 +584,14 @@ input[type="date"] { min-width: 0; }
   width: min(420px, calc(100% - 28px));
   max-height: calc(100% - 52px);
   overflow: auto;
-  background: rgba(8, 12, 18, 0.96);
+  background: var(--bg2);
   border: 1px solid rgba(var(--green-rgb), 0.28);
   border-radius: 16px;
   box-shadow: var(--glow), 0 18px 50px rgba(0, 0, 0, 0.45);
   padding: 12px 14px 16px;
+}
+html[data-remote="1"] .settings {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
 }
 .settings h2 { font-family: Orbitron, sans-serif; font-size: 16px; margin: 0 0 8px; }
 .settings h3 {
@@ -690,7 +698,7 @@ input[type="date"] { min-width: 0; }
   gap: 12px;
 }
 .journal-card-block {
-  background: rgba(12, 16, 23, 0.92);
+  background: var(--panel);
   border: 1px solid rgba(var(--green-rgb), 0.16);
   border-radius: var(--radius);
   box-shadow: var(--glow);
@@ -761,7 +769,7 @@ input[type="date"] { min-width: 0; }
 .journal-ctx {
   position: fixed; z-index: 12;
   min-width: 160px;
-  background: rgba(8, 12, 18, 0.98);
+  background: var(--bg2);
   border: 1px solid rgba(var(--green-rgb), 0.35);
   border-radius: 12px;
   padding: 8px;

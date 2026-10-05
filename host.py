@@ -102,6 +102,7 @@ VAULT_WORK = CONFIG_DIR / "vault-workspace"
 KWIN_SCRIPT = CONFIG_DIR / "kwin.js"
 SHORTCUT_FILE = CONFIG_DIR / "shortcut"
 PAUSE_MODE_FILE = CONFIG_DIR / "pause-mode"
+WINDOW_FILE = CONFIG_DIR / "window.json"
 KIT_MAX_BYTES = 24 * 1024 * 1024
 BUS_NAME = "org.laden.OpsDash.Bridge"
 BUS_PATH = "/org/laden/OpsDash/Bridge"
@@ -331,6 +332,35 @@ def save_pause_mode(enabled: bool) -> bool:
     flag = bool(enabled)
     PAUSE_MODE_FILE.write_text("1\n" if flag else "0\n", encoding="utf-8")
     return flag
+
+
+
+def default_window_snap() -> str:
+    try:
+        data = json.loads(WINDOW_FILE.read_text(encoding="utf-8"))
+        mode = str(data.get("snap") or "right").strip().lower()
+        if mode in ("left", "right", "off"):
+            return mode
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return "right"
+
+
+def save_window_snap(mode: str) -> str:
+    cleaned = str(mode or "right").strip().lower()
+    if cleaned not in ("left", "right", "off"):
+        cleaned = "right"
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    data = {"w": 1180, "h": 780, "snap": cleaned}
+    try:
+        existing = json.loads(WINDOW_FILE.read_text(encoding="utf-8"))
+        if isinstance(existing, dict):
+            data["w"] = int(existing.get("w") or data["w"])
+            data["h"] = int(existing.get("h") or data["h"])
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    WINDOW_FILE.write_text(json.dumps({"w": data["w"], "h": data["h"], "snap": cleaned}) + "\n", encoding="utf-8")
+    return cleaned
 
 
 def primary_shortcut(accel: str) -> str:
@@ -1328,7 +1358,7 @@ class Host:
             return {"ok": False, "error": "vault.conf is too large"}
         return {"ok": True, "exists": True, "text": raw.decode("utf-8", "replace")}
 
-    def account_fetch(self, url: str, method: str = "GET", body: str = "", token: str = "") -> dict:
+    def account_fetch(self, url: str, method: str = "GET", body: str = "", token: str = "", timeout: float | int | None = None) -> dict:
         """Call the Laden cloud vault service. The body and token are not logged."""
         target = (url or "").strip()
         verb = (method or "GET").strip().upper()
@@ -1340,6 +1370,11 @@ class Host:
             return {"ok": False, "error": "only http(s) URLs"}
         if parsed.scheme == "http" and host not in ("127.0.0.1", "localhost"):
             return {"ok": False, "error": "the cloud copy needs https"}
+        try:
+            wait = float(8 if timeout is None else timeout)
+        except (TypeError, ValueError):
+            wait = 8.0
+        wait = max(1.0, min(wait, 30.0))
         data = None
         headers = {"User-Agent": "laden-ops", "Accept": "application/json, text/plain"}
         if token:
@@ -1352,7 +1387,7 @@ class Host:
             headers["Content-Type"] = "text/plain; charset=utf-8"
         req = urllib.request.Request(target, data=data, headers=headers, method=verb)
         try:
-            with urllib.request.urlopen(req, timeout=8) as res:
+            with urllib.request.urlopen(req, timeout=wait) as res:
                 raw = res.read(8_000_000)
                 status = getattr(res, "status", 200)
         except urllib.error.HTTPError as exc:
@@ -1361,6 +1396,13 @@ class Host:
         except (urllib.error.URLError, TimeoutError, OSError):
             return {"ok": False, "error": "Could not reach the cloud copy"}
         return {"ok": True, "status": status, "body": raw.decode("utf-8", "replace")}
+
+    def window_snap(self) -> dict:
+        return {"ok": True, "mode": default_window_snap(), "supported": True}
+
+    def set_window_snap(self, mode: str) -> dict:
+        cleaned = save_window_snap(mode)
+        return {"ok": True, "mode": cleaned, "supported": True}
 
     def prepare_user_folder(self, email: str, username: str) -> dict:
         """Create the account folder, config, and vault. The password is not written here."""

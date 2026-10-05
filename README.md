@@ -2,7 +2,7 @@
 
 Personal dashboard in the laden.no palette: void black, hack green, cyan, Orbitron titles. It is a small GTK window, not the Electron project in `dashboard-build`.
 
-The first open asks you to log in or create an account with email and password. There is no account-server field. The password is the vault password. **Save** in Control writes `vault.conf` into the Laden Ops folder on that device, mode private to your user, and uploads a sealed copy to Laden's cloud at `https://laden.no/ldash`. The service keeps the account row in SQLite under `/var/lib/ldash` and a sealed file under `/var/lib/ldash/vaults/<id>/vault.conf`. The direct link is `/ldash/vault/<id>/vault.conf`. Opening the link does not show the kit. Login and create succeed from the local vault if the cloud is down. After the first successful create or login, Ldash asks once whether this device should sign in automatically next time. The account service is `account/server.py`. It does not log the password or the kit.
+The first open asks you to log in or create an account with email and password. There is no account-server field. The password is the vault password. **Save** in Control writes `vault.conf` into the Laden Ops folder on that device, mode private to your user, and uploads a sealed copy to Laden's cloud at `https://laden.no/ldash` (Docker api-main). If that path is unreachable, Ldash automatically tries the read-only standby at `https://laden.no/ldash-standby` (systemd ldash-account). Standby accepts login and vault fetch only; register and vault writes return 503 so nothing silently diverges. The service keeps the account row in SQLite under `/var/lib/ldash` and a sealed file under `/var/lib/ldash/vaults/<id>/vault.conf`. The direct link is `/ldash/vault/<id>/vault.conf`. Opening the link does not show the kit. Login and create succeed from the local vault if the cloud is down. After the first successful create or login, Ldash asks once whether this device should sign in automatically next time. The account service is `account/server.py`. It does not log the password or the kit.
 
 Ldash 1.0 is published by **Laden AS** ([laden.no](https://laden.no)). The Windows setup lists that publisher. The Android package is signed with a Laden AS certificate, and the fingerprint is in `android/dist/PUBLISHER.txt` beside the APK. Mac and iPhone show Laden AS in the app info. Each install file has a `SHA256SUMS` file in the same folder. Check it before you open the file:
 
@@ -75,6 +75,7 @@ The Ldash 1.0 Windows setup, Mac package, and Android package above are the laun
 
 ## What you can set
 
+- Window layout (Control): Right half (default), Left half, or Free window. Desktop only; follows the current monitor work area and re-applies on resolution change. Saved on this machine only.
 - Programs: any command or URL. The first open picks the starting set
 - Weather: city forecast from Open-Meteo, no key
 - Monitor: host stats, plus an app, a KWin window, or an HTTP API, and which fields are drawn (spark, bar, gauge, or readout)

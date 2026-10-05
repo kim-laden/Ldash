@@ -50,6 +50,7 @@ const shortcutPill = document.getElementById("shortcut-pill")
 const editBanner = document.getElementById("edit-banner")
 
 document.documentElement.dataset.accent = state.settings.accent
+applyRemoteUi(state.settings.remoteClean)
 if (shortcutPill) shortcutPill.textContent = state.settings.shortcut
 
 document.getElementById("settings-btn").onclick = () => {
@@ -140,6 +141,7 @@ function defaultState() {
       shortcut: "Ctrl+`,Ctrl+|",
       pauseMode: false,
       accent: "hack",
+      remoteClean: false,
       showCalendar: true,
       showSticky: true,
       showVault: true,
@@ -163,6 +165,7 @@ function defaultState() {
       autoLogin: null,
       localOnly: false,
       weatherCity: "",
+      windowSnap: "right",
     },
     grid: [
       { id: "apps", kind: "apps", size: "L", order: 0, visible: true },
@@ -1896,10 +1899,19 @@ async function boot() {
   const pause = await ladenCall("pauseMode")
   if (typeof pause?.enabled === "boolean") state.settings.pauseMode = pause.enabled
   await ladenCall("setPauseMode", { enabled: !!state.settings.pauseMode })
+  const snapInfo = await ladenCall("windowSnap")
+  if (snapInfo && typeof snapInfo.mode === "string") {
+    state.settings.windowSnap = snapInfo.mode
+    state._windowSnapSupported = snapInfo.supported !== false
+  } else {
+    state._windowSnapSupported = false
+  }
   const user = await ladenCall("localUser")
   if (user?.username) vaultUi.localUser = user.username
   showDragCatch()
   await hydrateLocalVault()
+  document.documentElement.dataset.accent = state.settings.accent
+  applyRemoteUi(!!state.settings.remoteClean)
   routeLaunch()
 }
 
@@ -2003,6 +2015,12 @@ function accountControl() {
   return box
 }
 
+
+function applyRemoteUi(on) {
+  if (on) document.documentElement.dataset.remote = "1"
+  else delete document.documentElement.dataset.remote
+}
+
 function renderSettings() {
   settingsEl.hidden = !settingsOpen
   syncChrome()
@@ -2067,8 +2085,37 @@ function renderSettings() {
       void ladenCall("setPauseMode", { enabled: v })
     }),
     h("p", { class: "hint" }, ["When on, opening the board mutes system audio and sends media play/pause so games can pause. Closing the board restores mute and resumes."]),
+    field("Window layout", (() => {
+      const snap = dropdown(
+        [
+          { value: "right", label: "Right half" },
+          { value: "left", label: "Left half" },
+          { value: "off", label: "Free window" },
+        ],
+        s.windowSnap === "left" || s.windowSnap === "off" ? s.windowSnap : "right",
+      )
+      snap.onchange = async () => {
+        s.windowSnap = snap.value
+        save()
+        const res = await ladenCall("setWindowSnap", { mode: s.windowSnap })
+        if (res && res.supported === false) state._windowSnapSupported = false
+        renderSettings()
+      }
+      return snap
+    })()),
+    h("p", { class: "hint" }, [
+      state._windowSnapSupported === false
+        ? "Half-screen dock is a desktop feature. On Android and in the browser demo this setting is kept but ignored."
+        : "Keeps Ldash on half of the current monitor's work area (full height, half width). It follows that monitor and re-applies when the resolution changes. Saved on this machine only.",
+    ]),
     field("Total size", capacity),
     h("p", { class: "hint" }, ["Every shown panel has to fit inside this total. Size is that panel's share. Fits is the smallest it can shrink and still hold what is inside."]),
+    toggle("Remote-friendly UI", !!s.remoteClean, (v) => {
+      s.remoteClean = v
+      applyRemoteUi(v)
+      save()
+    }),
+    h("p", { class: "hint" }, ["Solid panels, no scanlines/grid. Turn on over RustDesk or any remote desktop so dark areas stay clean."]),
     toggle("Edit layout", !!s.editMode, (v) => { s.editMode = v; save(); renderBoard() }),
     toggle("Show calendar", s.showCalendar, (v) => { s.showCalendar = v; save(); renderBoard() }),
     toggle("Show sticky notes", s.showSticky, (v) => { s.showSticky = v; save(); renderBoard() }),

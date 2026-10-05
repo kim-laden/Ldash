@@ -9,6 +9,7 @@ namespace LadenOps;
 internal static class Program
 {
     private const int WmHotkey = 0x0312;
+    private const int WmDisplayChange = 0x007E;
     private const uint ModAlt = 0x0001;
     private const uint ModControl = 0x0002;
     private const uint ModShift = 0x0004;
@@ -45,6 +46,7 @@ internal static class Program
 internal sealed class ShellForm : Form
 {
     private const int WmHotkey = 0x0312;
+    private const int WmDisplayChange = 0x007E;
     private const int WmNcHitTest = 0x84;
     private const int WmNcLButtonDown = 0xA1;
     private const int HtCaption = 2;
@@ -119,6 +121,10 @@ internal sealed class ShellForm : Form
         if (m.Msg == WmHotkey)
         {
             Toggle();
+        }
+        if (m.Msg == WmDisplayChange)
+        {
+            BeginInvoke(ApplyWindowSnap);
         }
         if (m.Msg == WmNcHitTest)
         {
@@ -202,6 +208,7 @@ internal sealed class ShellForm : Form
                 }
             };
             _view.Source = new Uri(_origin + "/");
+            BeginInvoke(ApplyWindowSnap);
         }
         catch (Exception ex)
         {
@@ -270,6 +277,7 @@ internal sealed class ShellForm : Form
                 var ev = doc.RootElement.GetProperty("event").GetString();
                 if (ev == "hide") BeginInvoke(HideWindow);
                 else if (ev == "drag") BeginInvoke(BeginDrag);
+                else if (ev == "snap") BeginInvoke(ApplyWindowSnap);
                 else if (ev == "quit")
                 {
                     BeginInvoke(() =>
@@ -336,6 +344,7 @@ internal sealed class ShellForm : Form
         ApplyPauseOnShow();
         Show();
         WindowState = FormWindowState.Normal;
+        ApplyWindowSnap();
         Activate();
     }
 
@@ -549,12 +558,51 @@ internal sealed class ShellForm : Form
         }
     }
 
+    private string ReadSnap()
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(_windowFile));
+            if (doc.RootElement.TryGetProperty("snap", out var snap))
+            {
+                var mode = (snap.GetString() ?? "right").Trim().ToLowerInvariant();
+                if (mode == "left" || mode == "right" || mode == "off") return mode;
+            }
+        }
+        catch (Exception)
+        {
+        }
+        return "right";
+    }
+
     private void SaveSize()
     {
         if (WindowState != FormWindowState.Normal) return;
         try
         {
-            File.WriteAllText(_windowFile, "{\"w\": " + ClientSize.Width + ", \"h\": " + ClientSize.Height + "}\n");
+            var snap = ReadSnap();
+            File.WriteAllText(_windowFile, "{\"w\": " + ClientSize.Width + ", \"h\": " + ClientSize.Height + ", \"snap\": \"" + snap + "\"}\n");
+        }
+        catch (IOException)
+        {
+        }
+    }
+
+    private void ApplyWindowSnap()
+    {
+        if (WindowState != FormWindowState.Normal) return;
+        var snap = ReadSnap();
+        if (snap != "left" && snap != "right") return;
+        var screen = Screen.FromControl(this);
+        var wa = screen.WorkingArea;
+        var half = Math.Max(680, wa.Width / 2);
+        var height = Math.Max(460, wa.Height);
+        var left = snap == "left" ? wa.Left : wa.Right - half;
+        Bounds = new Rectangle(left, wa.Top, half, height);
+        RoundFrame();
+        try
+        {
+            File.WriteAllText(_windowFile, "{\"w\": " + ClientSize.Width + ", \"h\": " + ClientSize.Height + ", \"snap\": \"" + snap + "\"}\n");
         }
         catch (IOException)
         {

@@ -75,9 +75,147 @@ def stored_window_size() -> tuple[int, int]:
         data = json.loads(GEOM_PATH.read_text(encoding="utf-8"))
         width = int(data["w"])
         height = int(data["h"])
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         return 1180, 780
     return max(680, min(width, 3840)), max(460, min(height, 2160))
+
+
+def stored_window_snap() -> str:
+    try:
+        data = json.loads(GEOM_PATH.read_text(encoding="utf-8"))
+        mode = str(data.get("snap") or "right").strip().lower()
+        if mode in ("left", "right", "off"):
+            return mode
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return "right"
+
+
+def save_geom(width: int, height: int, snap: str | None = None) -> None:
+    mode = stored_window_snap() if snap is None else snap
+    if mode not in ("left", "right", "off"):
+        mode = "right"
+    try:
+        GEOM_PATH.parent.mkdir(parents=True, exist_ok=True)
+        GEOM_PATH.write_text(
+            json.dumps({"w": int(width), "h": int(height), "snap": mode}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def monitor_workarea(win: Gtk.Window | None) -> tuple[int, int, int, int]:
+    display = Gdk.Display.get_default()
+    monitor = None
+    if win is not None:
+        surface = win.get_surface()
+        if surface is not None:
+            monitor = display.get_monitor_at_surface(surface)
+    if monitor is None:
+        list_model = display.get_monitors()
+        if list_model.get_n_items():
+            monitor = list_model.get_item(0)
+    if monitor is None:
+        return 0, 0, 1920, 1080
+    geom = monitor.get_workarea() if hasattr(monitor, "get_workarea") else monitor.get_geometry()
+    return int(geom.x), int(geom.y), int(geom.width), int(geom.height)
+
+
+def _x11_move_resize(win: Gtk.Window, x: int, y: int, w: int, h: int) -> bool:
+    try:
+        gi.require_version("GdkX11", "4.0")
+        from gi.repository import GdkX11
+    except Exception:
+        return False
+    surface = win.get_surface()
+    if surface is None or not isinstance(surface, GdkX11.X11Surface):
+        return False
+    try:
+        import ctypes
+        from ctypes.util import find_library
+        lib = find_library("X11")
+        if not lib:
+            return False
+        x11 = ctypes.CDLL(lib)
+        display = GdkX11.X11Display.get_xdisplay(surface.get_display())
+        xid = surface.get_xid()
+        x11.XMoveResizeWindow(display, ctypes.c_ulong(xid), int(x), int(y), int(w), int(h))
+        x11.XFlush(display)
+        return True
+    except Exception:
+        return False
+
+
+def _kwin_move_resize(x: int, y: int, w: int, h: int) -> bool:
+    """Best-effort Plasma snap via a one-shot KWin script."""
+    import shutil
+    import subprocess
+    import tempfile
+    qdbus = shutil.which("qdbus6") or shutil.which("qdbus")
+    if not qdbus:
+        return False
+    script = f"""
+var targets = ["Laden Ops", "Ldash"];
+var list = workspace.windowList();
+for (var i = 0; i < list.length; i++) {{
+  var win = list[i];
+  if (!win || !win.caption) continue;
+  var title = String(win.caption);
+  var hit = false;
+  for (var t = 0; t < targets.length; t++) {{
+    if (title.indexOf(targets[t]) === 0 || title === targets[t]) hit = true;
+  }}
+  if (!hit) continue;
+  try {{
+    win.frameGeometry = {{ x: {int(x)}, y: {int(y)}, width: {int(w)}, height: {int(h)} }};
+  }} catch (e) {{
+    try {{ win.geometry = {{ x: {int(x)}, y: {int(y)}, width: {int(w)}, height: {int(h)} }}; }} catch (e2) {{}}
+  }}
+}}
+"""
+    path = None
+    try:
+        fd, path = tempfile.mkstemp(prefix="ldash-snap-", suffix=".js")
+        import os
+        os.close(fd)
+        Path(path).write_text(script, encoding="utf-8")
+        plugin = "opsdash-snap"
+        for cmd in (
+            [qdbus, "org.kde.KWin", "/Scripting", "unloadScript", plugin],
+            [qdbus, "org.kde.KWin", "/Scripting", "loadScript", path, plugin],
+            [qdbus, "org.kde.KWin", "/Scripting", "start"],
+        ):
+            subprocess.run(cmd, check=False, timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([qdbus, "org.kde.KWin", "/Scripting", "unloadScript", plugin], check=False, timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+    finally:
+        if path:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _wmctrl_move_resize(x: int, y: int, w: int, h: int) -> bool:
+    import shutil
+    import subprocess
+    wmctrl = shutil.which("wmctrl")
+    if not wmctrl:
+        return False
+    try:
+        subprocess.run(
+            [wmctrl, "-r", "Laden Ops", "-e", f"0,{int(x)},{int(y)},{int(w)},{int(h)}"],
+            check=False,
+            timeout=2,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def add_resize_edges(overlay: Gtk.Overlay, on_press) -> None:
@@ -160,6 +298,8 @@ class OpsApp(Gtk.Application):
         self._last_toggle = 0.0
         self._bridge: Bridge | None = None
         self._geom = (0, 0)
+        self._snap = stored_window_snap()
+        self._snap_sig = None
 
     def do_startup(self) -> None:
         Gtk.Application.do_startup(self)
@@ -228,7 +368,15 @@ class OpsApp(Gtk.Application):
         self.window = win
         self.webview = web
         self._show()
+        GLib.idle_add(self._apply_window_snap)
         GLib.timeout_add(800, self._track_size)
+        GLib.timeout_add(1500, self._watch_display)
+        try:
+            display = Gdk.Display.get_default()
+            display.connect("monitor-added", lambda *_: GLib.idle_add(self._apply_window_snap))
+            display.connect("monitor-removed", lambda *_: GLib.idle_add(self._apply_window_snap))
+        except Exception:
+            pass
 
     def _apply_css(self) -> None:
         provider = Gtk.CssProvider()
@@ -270,6 +418,48 @@ class OpsApp(Gtk.Application):
         except Exception as exc:
             print(f"laden-ops resize failed {place} {exc}", flush=True)
 
+    def _apply_window_snap(self, mode: str | None = None) -> bool:
+        win = self.window
+        if win is None:
+            return False
+        snap = (mode or self._snap or stored_window_snap()).strip().lower()
+        if snap not in ("left", "right", "off"):
+            snap = "right"
+        self._snap = snap
+        if snap == "off":
+            return False
+        x, y, w, h = monitor_workarea(win)
+        half = max(680, w // 2)
+        nh = max(460, h)
+        nx = x if snap == "left" else x + max(0, w - half)
+        ny = y
+        self._snap_sig = (x, y, w, h, snap)
+        win.set_default_size(half, nh)
+        try:
+            win.set_size_request(680, 460)
+        except Exception:
+            pass
+        # Prefer native moves; fall back to KWin/wmctrl on compositors that ignore GTK position.
+        moved = _x11_move_resize(win, nx, ny, half, nh)
+        if not moved:
+            moved = _wmctrl_move_resize(nx, ny, half, nh)
+        if not moved:
+            _kwin_move_resize(nx, ny, half, nh)
+        self._geom = (half, nh)
+        save_geom(half, nh, snap)
+        return False
+
+    def _watch_display(self) -> bool:
+        win = self.window
+        if win is None:
+            return False
+        if self._snap == "off":
+            return True
+        sig = monitor_workarea(win) + (self._snap,)
+        if sig != self._snap_sig:
+            self._apply_window_snap()
+        return True
+
     def _track_size(self) -> bool:
         win = self.window
         if win is None:
@@ -280,11 +470,11 @@ class OpsApp(Gtk.Application):
         if width < 200 or height < 200 or (width, height) == self._geom:
             return True
         self._geom = (width, height)
-        try:
-            GEOM_PATH.parent.mkdir(parents=True, exist_ok=True)
-            GEOM_PATH.write_text(json.dumps({"w": width, "h": height}), encoding="utf-8")
-        except OSError:
-            pass
+        # While snapped, keep the half-screen layout rather than free-resize persistence alone.
+        if self._snap in ("left", "right"):
+            save_geom(width, height, self._snap)
+            return True
+        save_geom(width, height, "off")
         return True
 
     def _on_load(self, _web, event) -> None:
@@ -415,6 +605,16 @@ class OpsApp(Gtk.Application):
             return self.host.install_kwin(str(params.get("shortcut") or "Ctrl+`"))
         if method == "setPauseMode":
             return self.host.set_pause_mode(bool(params.get("enabled")))
+        if method == "windowSnap":
+            return {"ok": True, "mode": self._snap if hasattr(self, "_snap") else stored_window_snap(), "supported": True}
+        if method == "setWindowSnap":
+            mode = str(params.get("mode") or "right").strip().lower()
+            if mode not in ("left", "right", "off"):
+                mode = "right"
+            self._snap = mode
+            save_geom(*(self._geom if self._geom != (0, 0) else stored_window_size()), mode)
+            GLib.idle_add(self._apply_window_snap, mode)
+            return {"ok": True, "mode": mode, "supported": True}
         if method == "pauseMode":
             return self.host.pause_mode()
         if method == "prepareUserFolder":
@@ -431,6 +631,7 @@ class OpsApp(Gtk.Application):
                 str(params.get("method") or "GET"),
                 str(params.get("body") or ""),
                 str(params.get("token") or ""),
+                params.get("timeout"),
             )
         if method == "dragWindow":
             return {"ok": True}
@@ -447,6 +648,7 @@ class OpsApp(Gtk.Application):
     def _show(self) -> None:
         if self.window is None:
             return
+        self._apply_window_snap()
         self.window.present()
         self.window.set_visible(True)
         self._visible = True

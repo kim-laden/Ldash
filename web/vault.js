@@ -1062,11 +1062,56 @@ function confStatus(kind, text) {
 var sessionSecret = ""
 
 // Fixed Laden cloud for sealed vault.conf copies. Not a user field.
+// Primary is Docker api-main. Standby is the systemd copy, read-only for writes.
 const CLOUD_ACCOUNT_BASE = "https://laden.no/ldash"
+const CLOUD_ACCOUNT_STANDBY = "https://laden.no/ldash-standby"
 
 function accountBase() {
   state.settings.accountBase = CLOUD_ACCOUNT_BASE
   return CLOUD_ACCOUNT_BASE
+}
+
+function standbyBase() {
+  return CLOUD_ACCOUNT_STANDBY
+}
+
+function rewriteAccountUrl(url, fromBase, toBase) {
+  const target = String(url || "").trim()
+  const src = String(fromBase || "").replace(/\/$/, "")
+  const dst = String(toBase || "").replace(/\/$/, "")
+  if (!target || !src || !dst) return target
+  if (target === src) return dst
+  if (target.startsWith(src + "/")) return dst + target.slice(src.length)
+  return target
+}
+
+function shouldFailoverAccount(res) {
+  if (!res || res.ok === false) return true
+  const status = Number(res.status || 0)
+  if (!status) return true
+  if (status === 401 || status === 403 || status === 400 || status === 404 || status === 409) return false
+  return status >= 500
+}
+
+async function accountFetchOnce(url, method, body, token, timeoutSec) {
+  return ladenCall("accountFetch", {
+    url,
+    method: method || "GET",
+    body: body || "",
+    token: token || "",
+    timeout: timeoutSec || 4,
+  })
+}
+
+async function accountFetchResilient(url, method, body, token) {
+  const primary = String(url || "").trim()
+  const first = await accountFetchOnce(primary, method, body, token, 3.5)
+  if (!shouldFailoverAccount(first)) return Object.assign({}, first, { accountVia: "primary" })
+  const standbyUrl = rewriteAccountUrl(primary, CLOUD_ACCOUNT_BASE, CLOUD_ACCOUNT_STANDBY)
+  if (!standbyUrl || standbyUrl === primary) return Object.assign({}, first || {}, { accountVia: "primary" })
+  const second = await accountFetchOnce(standbyUrl, method, body, token, 6)
+  if (second && second.ok !== false) return Object.assign({}, second, { accountVia: "standby" })
+  return Object.assign({}, first || second || {}, { accountVia: "primary" })
 }
 
 function parseAccountBody(res) {
@@ -1081,9 +1126,9 @@ function parseAccountBody(res) {
     }
   }
   if (res.status && Number(res.status) >= 400) {
-    return { ok: false, error: (body && body.error) || "The cloud copy refused the request." }
+    return { ok: false, error: (body && body.error) || "The cloud copy refused the request.", status: Number(res.status) }
   }
-  return { ok: true, body: body || {} }
+  return { ok: true, body: body || {}, accountVia: res.accountVia || "primary" }
 }
 
 async function composePlainConf() {
@@ -1105,15 +1150,14 @@ async function pushAccountConf(plainText) {
       kit.settings.localOnly = false
     }
     const sealed = await sealVaultConf(kit, sessionSecret)
-    const res = await ladenCall("accountFetch", {
-      url: base + "/v1/vault",
-      method: "PUT",
-      body: serializeConf(sealed),
-      token,
-    })
+    const res = await accountFetchResilient(base + "/v1/vault", "PUT", serializeConf(sealed), token)
     const parsed = parseAccountBody(res)
     if (!parsed.ok) return { ok: false, soft: true, error: parsed.error || "Cloud copy skipped." }
-    const url = parsed.body.confUrl || state.settings.confUrl || ""
+    // Prefer the primary confUrl shape so later pulls hit main first.
+    let url = parsed.body.confUrl || state.settings.confUrl || ""
+    if (url && parsed.accountVia === "standby") {
+      url = rewriteAccountUrl(url, CLOUD_ACCOUNT_STANDBY, CLOUD_ACCOUNT_BASE) || url
+    }
     if (url) state.settings.confUrl = url
     save()
     return { ok: true, confUrl: url }
@@ -1132,31 +1176,35 @@ async function persistKit() {
 
 async function accountAuth(kind, email, password) {
   const base = accountBase()
-  const res = await ladenCall("accountFetch", {
-    url: base + (kind === "register" ? "/v1/register" : "/v1/login"),
-    method: "POST",
-    body: JSON.stringify({ email, password }),
-  })
+  const res = await accountFetchResilient(
+    base + (kind === "register" ? "/v1/register" : "/v1/login"),
+    "POST",
+    JSON.stringify({ email, password }),
+    "",
+  )
   if (!res || res.ok === false) {
     return { ok: false, unreachable: true, error: res?.error || "Could not reach the cloud copy" }
   }
   const parsed = parseAccountBody(res)
   if (!parsed.ok) return parsed
   const token = parsed.body.token || ""
-  const confUrl = parsed.body.confUrl || ""
+  let confUrl = parsed.body.confUrl || ""
+  if (confUrl && parsed.accountVia === "standby") {
+    confUrl = rewriteAccountUrl(confUrl, CLOUD_ACCOUNT_STANDBY, CLOUD_ACCOUNT_BASE) || confUrl
+  }
   if (!token || !confUrl) return { ok: false, error: "The cloud copy did not return a vault.conf link." }
-  return { ok: true, token, confUrl }
+  return { ok: true, token, confUrl, standby: !!parsed.body.readOnly || parsed.accountVia === "standby" }
 }
 
 async function pullAccountConf(confUrl, password) {
-  const res = await ladenCall("accountFetch", { url: confUrl, method: "GET" })
+  const res = await accountFetchResilient(confUrl, "GET", "", "")
   if (!res || res.ok === false) return { ok: false, soft: true, error: res?.error || "Could not read the online vault.conf" }
   if (Number(res.status) === 404) return { ok: true, empty: true }
   if (res.status && Number(res.status) >= 400) return { ok: false, soft: true, error: "Could not read the online vault.conf" }
   const raw = typeof res.body === "string" ? res.body : JSON.stringify(res.body || "")
   if (!raw || raw.indexOf("laden.vault.conf") < 0) return { ok: true, empty: true }
   const payload = await resolveVaultConf(parseVaultConfText(raw), password)
-  return { ok: true, payload }
+  return { ok: true, payload, accountVia: res.accountVia || "primary" }
 }
 
 async function exportVaultConf(sealPass) {

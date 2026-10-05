@@ -92,6 +92,8 @@ class PhoneHost(private val context: Context, private val chrome: PhoneChrome) {
                 "saveVaultConf" -> saveVaultConf(str(params, "text"))
                 "loadVaultConf" -> loadVaultConf()
                 "accountFetch" -> accountFetch(params)
+                "windowSnap" -> JSONObject().put("ok", true).put("mode", "off").put("supported", false)
+                "setWindowSnap" -> JSONObject().put("ok", true).put("mode", str(params, "mode").ifBlank { "off" }).put("supported", false)
                 else -> fail("unknown method $method")
             }
         } catch (exc: Exception) {
@@ -342,7 +344,9 @@ class PhoneHost(private val context: Context, private val chrome: PhoneChrome) {
         val token = str(params, "token")
         if (token.isNotEmpty()) headers["Authorization"] = "Bearer $token"
         if (raw != null) headers["Content-Type"] = "text/plain; charset=utf-8"
-        val (status, data, failure) = transfer(url, method, headers, raw, httpsOnly = scheme == "https", timeoutMs = 20_000)
+        val timeoutSec = params.optDouble("timeout", 8.0)
+        val timeoutMs = (timeoutSec.coerceIn(1.0, 30.0) * 1000).toInt()
+        val (status, data, failure) = transfer(url, method, headers, raw, httpsOnly = scheme == "https", timeoutMs = timeoutMs)
         if (failure != null) return fail("Could not reach the cloud copy")
         return JSONObject().put("ok", true).put("status", status).put("body", data.toString(Charsets.UTF_8))
     }

@@ -24,6 +24,7 @@ DB_PATH = os.path.join(DATA, "ldash.sqlite")
 VAULTS = os.environ.get("LDASH_ACCOUNT_VAULTS", os.path.join(DATA, "vaults"))
 PUBLIC = os.environ.get("LDASH_ACCOUNT_PUBLIC", "http://127.0.0.1:8741").rstrip("/")
 BIND = os.environ.get("LDASH_ACCOUNT_BIND", "127.0.0.1:8741")
+READONLY = os.environ.get("LDASH_ACCOUNT_READONLY", "").strip().lower() in ("1", "true", "yes", "on")
 MAX_BODY = 8_000_000
 
 
@@ -36,10 +37,11 @@ def ensure_store() -> None:
     os.makedirs(VAULTS, mode=0o700, exist_ok=True)
 
 
-def vault_path(account_id: str) -> str:
+def vault_path(account_id: str, create: bool = True) -> str:
     safe = "".join(ch for ch in account_id if ch.isalnum() or ch in "-_")[:64]
     folder = os.path.join(VAULTS, safe or "_")
-    os.makedirs(folder, mode=0o700, exist_ok=True)
+    if create:
+        os.makedirs(folder, mode=0o700, exist_ok=True)
     return os.path.join(folder, "vault.conf")
 
 
@@ -56,7 +58,7 @@ def write_vault_file(account_id: str, conf: str) -> None:
 
 
 def read_vault_file(account_id: str) -> str:
-    path = vault_path(account_id)
+    path = vault_path(account_id, create=False)
     if not os.path.isfile(path):
         return ""
     with open(path, "r", encoding="utf-8") as handle:
@@ -144,7 +146,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/v1/health":
-            self._json(200, {"ok": True})
+            payload = {"ok": True}
+            if READONLY:
+                payload["readOnly"] = True
+                payload["role"] = "standby"
+            self._json(200, payload)
             return
         prefix = "/vault/"
         if path.startswith(prefix) and path.endswith("/vault.conf"):
@@ -168,6 +174,9 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path not in ("/v1/register", "/v1/login"):
             self._json(404, {"ok": False, "error": "Not found"})
+            return
+        if READONLY and path == "/v1/register":
+            self._json(503, {"ok": False, "error": "Standby is read-only. Create the account when the main cloud is back."})
             return
         body = read_json(self._read())
         email = str(body.get("email") or "").strip().lower()
@@ -196,13 +205,23 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 account_id = row["id"]
                 token = secrets.token_urlsafe(32)
-                db.execute("UPDATE accounts SET token_hash = ? WHERE id = ?", (token_hash(token), account_id))
-                db.commit()
-        self._json(200, {"ok": True, "token": token, "confUrl": public_link(account_id)})
+                # Standby login verifies only. Do not write a token that could
+                # later PUT into a stale copy and diverge from main.
+                if not READONLY:
+                    db.execute("UPDATE accounts SET token_hash = ? WHERE id = ?", (token_hash(token), account_id))
+                    db.commit()
+        payload = {"ok": True, "token": token, "confUrl": public_link(account_id)}
+        if READONLY:
+            payload["standby"] = True
+            payload["readOnly"] = True
+        self._json(200, payload)
 
     def do_PUT(self) -> None:
         if urlparse(self.path).path != "/v1/vault":
             self._json(404, {"ok": False, "error": "Not found"})
+            return
+        if READONLY:
+            self._json(503, {"ok": False, "error": "Standby is read-only. Vault writes wait for the main cloud."})
             return
         token = self._bearer()
         if not token:

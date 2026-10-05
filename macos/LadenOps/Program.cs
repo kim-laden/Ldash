@@ -149,6 +149,7 @@ internal sealed class Shell
                     InstallLifecycle();
                     InstallMenu();
                     InstallFrame();
+                    ApplyWindowSnap();
                     if (_backendOk) StartServices();
                 }
                 catch (Exception ex)
@@ -498,6 +499,10 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
                     Log($"{DateTime.Now:HH:mm:ss} hide (board)");
                     OnMain(HideWindow);
                 }
+                else if (ev == "snap")
+                {
+                    OnMain(ApplyWindowSnap);
+                }
                 else if (ev == "quit")
                 {
                     OnMain(() => RequestQuit("board Quit"));
@@ -629,6 +634,7 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
                 Send(win, Sel("deminiaturize:"), IntPtr.Zero);
             Send(win, Sel("makeKeyAndOrderFront:"), IntPtr.Zero);
         }
+        Program.Current?.ApplyWindowSnap();
         SendBoolArg(app, Sel("activateIgnoringOtherApps:"), 1);
     }
 
@@ -906,10 +912,11 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
             if (win == IntPtr.Zero) return;
             SendBoolArg(win, Sel("setTitlebarAppearsTransparent:"), 1);
             SendNUInt(win, Sel("setTitleVisibility:"), 1);
-            SendBoolArg(win, Sel("setOpaque:"), 0);
+            // Opaque dark fill — clear/transparent windows smear into banding over RustDesk.
+            SendBoolArg(win, Sel("setOpaque:"), 1);
             SendBoolArg(win, Sel("setHasShadow:"), 1);
-            var clear = SendId(objc_getClass("NSColor"), Sel("clearColor"));
-            if (clear != IntPtr.Zero) Send(win, Sel("setBackgroundColor:"), clear);
+            var fill = SendId(objc_getClass("NSColor"), Sel("blackColor"));
+            if (fill != IntPtr.Zero) Send(win, Sel("setBackgroundColor:"), fill);
             for (nuint button = 0; button < 3; button++)
             {
                 var control = SendNUIntRet(win, Sel("standardWindowButton:"), button);
@@ -1051,6 +1058,23 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
         }
     }
 
+    private string ReadSnap()
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(_windowFile));
+            if (doc.RootElement.TryGetProperty("snap", out var snap))
+            {
+                var mode = (snap.GetString() ?? "right").Trim().ToLowerInvariant();
+                if (mode == "left" || mode == "right" || mode == "off") return mode;
+            }
+        }
+        catch (Exception)
+        {
+        }
+        return "right";
+    }
+
     private void SaveSize(int w, int h)
     {
         if (w < 680 || h < 460) return;
@@ -1058,11 +1082,75 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
         _height = h;
         try
         {
-            File.WriteAllText(_windowFile, "{\"w\": " + w + ", \"h\": " + h + "}\n");
+            var snap = ReadSnap();
+            File.WriteAllText(_windowFile, "{\"w\": " + w + ", \"h\": " + h + ", \"snap\": \"" + snap + "\"}\n");
         }
         catch (IOException)
         {
         }
+    }
+
+    private void ApplyWindowSnap()
+    {
+        var snap = ReadSnap();
+        if (snap != "left" && snap != "right") return;
+        try
+        {
+            RememberWindow();
+            var win = _nsWindow != IntPtr.Zero ? _nsWindow : MainWindow(SharedApp());
+            if (win == IntPtr.Zero || _window == null) return;
+            var screen = SendId(win, Sel("screen"));
+            if (screen == IntPtr.Zero)
+                screen = SendId(objc_getClass("NSScreen"), Sel("mainScreen"));
+            if (screen == IntPtr.Zero) return;
+            var vis = VisibleFrame(screen);
+            // Cocoa origin is bottom-left. Photino SetTop uses top-left style coordinates
+            // matching window Location; Photino SetLeft/SetTop map to the content position.
+            var half = Math.Max(680, (int)(vis.W / 2));
+            var height = Math.Max(460, (int)vis.H);
+            var left = snap == "left" ? (int)vis.X : (int)(vis.X + vis.W - half);
+            // Convert Cocoa Y (bottom-left) to top-left for Photino SetTop.
+            var screenHeight = vis.Y + vis.H; // top of visible frame in Cocoa coords is vis.Y+vis.H from bottom of screen... 
+            // Photino's SetTop is the distance from the top of the screen.
+            // visibleFrame.Y is dock height from bottom; top offset from screen top:
+            // screen.frame height - (vis.Y + vis.H) = menu bar region.
+            var full = FrameOf(screen);
+            var topFromScreenTop = (int)((full.Y + full.H) - (vis.Y + vis.H));
+            _window.SetSize(half, height);
+            _window.SetLeft(left);
+            _window.SetTop(Math.Max(0, topFromScreenTop));
+            _width = half;
+            _height = height;
+            try
+            {
+                File.WriteAllText(_windowFile, "{\"w\": " + half + ", \"h\": " + height + ", \"snap\": \"" + snap + "\"}\n");
+            }
+            catch (IOException)
+            {
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("snap: " + ex.Message);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NsRect
+    {
+        public double X;
+        public double Y;
+        public double W;
+        public double H;
+    }
+
+    private static NsRect VisibleFrame(IntPtr screen) => MsgSendRect(screen, Sel("visibleFrame"));
+    private static NsRect FrameOf(IntPtr screen) => MsgSendRect(screen, Sel("frame"));
+
+    private static NsRect MsgSendRect(IntPtr recv, IntPtr sel)
+    {
+        // arm64 and modern x64 return CGRect in registers; use a typed objc_msgSend.
+        return objc_msgSend_rect(recv, sel);
     }
 
     private bool TryReadShortcut(out string text)
@@ -1340,6 +1428,9 @@ function send(m){try{window.external.sendMessage(m)}catch(e){}}
 
     [DllImport(ObjC, EntryPoint = "objc_msgSend")]
     private static extern IntPtr objc_msgSend(IntPtr recv, IntPtr sel);
+
+    [DllImport(ObjC, EntryPoint = "objc_msgSend")]
+    private static extern NsRect objc_msgSend_rect(IntPtr recv, IntPtr sel);
 
     [DllImport(ObjC, EntryPoint = "objc_msgSend")]
     private static extern IntPtr objc_msgSend_id(IntPtr recv, IntPtr sel, IntPtr arg);

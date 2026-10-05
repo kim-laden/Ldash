@@ -191,7 +191,14 @@ def dispatch(method: str, params: dict) -> dict:
                 str(params.get("method") or "GET"),
                 str(params.get("body") or ""),
                 str(params.get("token") or ""),
+                params.get("timeout"),
             )
+        if method == "windowSnap":
+            return HOST.window_snap()
+        if method == "setWindowSnap":
+            result = HOST.set_window_snap(str(params.get("mode") or "right"))
+            CONTROL.put("snap")
+            return result
         if method == "dragWindow":
             CONTROL.put("drag")
             return {"ok": True}
