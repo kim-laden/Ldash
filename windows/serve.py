@@ -112,6 +112,10 @@ def dispatch(method: str, params: dict) -> dict:
             return HOST.get_windows()
         if method == "launch":
             return HOST.launch(str(params.get("command") or ""))
+        if method == "detectDefaults":
+            return HOST.detect_defaults()
+        if method == "listInstalledApps":
+            return HOST.list_installed_apps()
         if method == "fetch":
             return HOST.fetch(str(params.get("url") or ""))
         if method == "localUser":

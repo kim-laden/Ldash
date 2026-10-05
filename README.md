@@ -75,6 +75,7 @@ The Ldash 1.0 Windows setup, Mac package, and Android package above are the laun
 
 ## What you can set
 
+- First-time setup: autodetects the OS default browser and terminal (overridable), then offers a searchable checklist of installed apps plus manual add. Nothing is uploaded until vault.conf is confirmed. Import-.conf still works; an existing local vault.conf stays the vault.
 - Window layout (Control): Right half (default), Left half, or Free window. Desktop only; follows the current monitor work area and re-applies on resolution change. Saved on this machine only.
 - Programs: any command or URL. The first open picks the starting set
 - Weather: city forecast from Open-Meteo, no key

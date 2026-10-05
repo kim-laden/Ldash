@@ -1249,6 +1249,20 @@ class Host:
             rows = list(self.windows)
         return {"ok": True, "windows": rows}
 
+    def detect_defaults(self) -> dict:
+        try:
+            from appsdetect import detect_defaults as _detect
+            return _detect()
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "platform": sys.platform, "terminalAvailable": sys.platform != "android"}
+
+    def list_installed_apps(self) -> dict:
+        try:
+            from appsdetect import list_installed_apps as _list
+            return _list()
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "apps": [], "suggestions": False}
+
     def launch(self, command: str) -> dict:
         command = (command or "").strip()
         if not command:

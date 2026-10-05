@@ -681,3 +681,292 @@ def check_password(user: str, password: str) -> dict:
     if err in (126, 127, 1):
         return {"ok": password == user, "method": "username-fallback"}
     return {"ok": False, "method": "logon"}
+
+def detect_defaults() -> dict:
+    browser_choices = _win_browser_choices()
+    terminal_choices = _win_terminal_choices()
+    browser = _win_default_browser(browser_choices) or (browser_choices[0] if browser_choices else {"id": "start", "name": "Default browser", "command": "start https://www.google.com"})
+    terminal = _win_default_terminal(terminal_choices) or (terminal_choices[0] if terminal_choices else {"id": "cmd", "name": "Command Prompt", "command": "cmd"})
+    return {
+        "ok": True,
+        "platform": "win32",
+        "browser": browser,
+        "terminal": terminal,
+        "browserChoices": browser_choices,
+        "terminalChoices": terminal_choices,
+        "terminalAvailable": True,
+    }
+
+
+def list_installed_apps() -> dict:
+    apps = []
+    seen = set()
+    for row in _win_start_menu_apps():
+        key = row["id"]
+        if key in seen:
+            continue
+        seen.add(key)
+        apps.append(row)
+        if len(apps) >= 400:
+            break
+    for row in _win_app_paths_and_uninstall():
+        key = row["id"]
+        if key in seen:
+            continue
+        seen.add(key)
+        apps.append(row)
+        if len(apps) >= 400:
+            break
+    apps.sort(key=lambda r: r["name"].lower())
+    return {"ok": True, "platform": "win32", "apps": apps, "suggestions": True}
+
+
+def _win_reg_value(root, path: str, name: str) -> str:
+    try:
+        import winreg
+    except ImportError:
+        return ""
+    try:
+        with winreg.OpenKey(root, path) as key:
+            val, _ = winreg.QueryValueEx(key, name)
+            return str(val or "")
+    except OSError:
+        return ""
+
+
+def _win_browser_choices() -> list:
+    rows = []
+    # Common ProgIds / paths
+    candidates = [
+        ("chrome", "Google Chrome", r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+        ("msedge", "Microsoft Edge", r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"),
+        ("firefox", "Firefox", r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe"),
+        ("brave", "Brave", r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\brave.exe"),
+        ("opera", "Opera", r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\opera.exe"),
+    ]
+    try:
+        import winreg
+        roots = (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE)
+    except ImportError:
+        roots = ()
+    for cid, name, reg_path in candidates:
+        exe = ""
+        for root in roots:
+            exe = _win_reg_value(root, reg_path, "")
+            if exe and Path(exe).is_file():
+                break
+            exe = ""
+        if exe:
+            rows.append({"id": cid, "name": name, "command": f'"{exe}" https://www.google.com'})
+    rows.append({"id": "start", "name": "System default (start)", "command": "start https://www.google.com"})
+    return rows
+
+
+def _win_terminal_choices() -> list:
+    rows = []
+    wt = shutil.which("wt") or shutil.which("wt.exe")
+    if wt:
+        rows.append({"id": "wt", "name": "Windows Terminal", "command": "wt"})
+    ps = shutil.which("pwsh") or shutil.which("powershell")
+    if ps:
+        rows.append({"id": "powershell", "name": "PowerShell", "command": f'"{ps}"' if " " in ps else ps})
+    rows.append({"id": "cmd", "name": "Command Prompt", "command": "cmd"})
+    return rows
+
+
+def _win_default_browser(choices: list) -> dict | None:
+    try:
+        import winreg
+    except ImportError:
+        return choices[0] if choices else None
+    prog = _win_reg_value(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice",
+        "ProgId",
+    )
+    mapping = {
+        "ChromeHTML": "chrome",
+        "MSEdgeHTM": "msedge",
+        "FirefoxURL": "firefox",
+        "BraveHTML": "brave",
+        "OperaStable": "opera",
+    }
+    # ProgId may be FirefoxURL-xxxxx
+    want = None
+    for prefix, cid in mapping.items():
+        if prog.startswith(prefix) or prog == prefix:
+            want = cid
+            break
+    if want:
+        for row in choices:
+            if row["id"] == want:
+                return row
+    # Resolve command from HKCR ProgId
+    if prog:
+        cmd = _win_reg_value(winreg.HKEY_CLASSES_ROOT, prog + r"\shell\open\command", "")
+        if cmd:
+            # Strip "%1" placeholders
+            cleaned = cmd.replace("%1", "https://www.google.com").replace("%*", "").strip()
+            return {"id": "progid", "name": prog, "command": cleaned}
+    return choices[0] if choices else None
+
+
+def _win_default_terminal(choices: list) -> dict | None:
+    for cid in ("wt", "powershell", "cmd"):
+        for row in choices:
+            if row["id"] == cid:
+                return row
+    return choices[0] if choices else None
+
+
+def _win_start_menu_apps() -> list:
+    roots = []
+    appdata = os.environ.get("APPDATA")
+    progdata = os.environ.get("PROGRAMDATA")
+    if appdata:
+        roots.append(Path(appdata) / "Microsoft/Windows/Start Menu/Programs")
+    if progdata:
+        roots.append(Path(progdata) / "Microsoft/Windows/Start Menu/Programs")
+    apps = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            links = list(root.rglob("*.lnk"))
+        except OSError:
+            continue
+        for link in links:
+            if len(apps) >= 350:
+                return apps
+            name = link.stem
+            if name.lower().startswith("uninstall"):
+                continue
+            target = _win_resolve_lnk(link)
+            if not target:
+                # Still list as start-menu launch via explorer
+                cmd = f'explorer "{link}"'
+            else:
+                cmd = f'"{target}"' if " " in target else target
+            apps.append({
+                "id": "lnk:" + str(link).replace("\\", "/").lower()[-180:],
+                "name": name[:80],
+                "command": cmd[:400],
+                "kind": "lnk",
+                "icon": None,
+            })
+    return apps
+
+
+def _win_resolve_lnk(path: Path) -> str:
+    # Prefer PowerShell COM resolve; fail soft. Skip if slow — listing still works via explorer.
+    try:
+        target = str(path)
+        script = (
+            "$p = $env:LADEN_LNK; "
+            "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($p); "
+            "Write-Output $s.TargetPath"
+        )
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", script],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            env={**os.environ, "LADEN_LNK": target},
+        ).strip()
+        if out and Path(out).exists():
+            return out
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+def _win_app_paths_and_uninstall() -> list:
+    try:
+        import winreg
+    except ImportError:
+        return []
+    apps = []
+    # App Paths
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            base = winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths")
+        except OSError:
+            continue
+        i = 0
+        while True:
+            try:
+                name = winreg.EnumKey(base, i)
+            except OSError:
+                break
+            i += 1
+            if not name.lower().endswith(".exe"):
+                continue
+            exe = _win_reg_value(root, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\\" + name, "")
+            if not exe or not Path(exe).is_file():
+                continue
+            label = Path(name).stem
+            apps.append({
+                "id": "apppath:" + name.lower(),
+                "name": label[:80],
+                "command": f'"{exe}"' if " " in exe else exe,
+                "kind": "apppath",
+                "icon": None,
+            })
+            if len(apps) >= 80:
+                break
+        try:
+            winreg.CloseKey(base)
+        except OSError:
+            pass
+    # Uninstall DisplayName + DisplayIcon/InstallLocation (names only; launch via DisplayIcon when .exe)
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for sub in (
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ):
+            try:
+                base = winreg.OpenKey(root, sub)
+            except OSError:
+                continue
+            i = 0
+            while True:
+                try:
+                    key_name = winreg.EnumKey(base, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(base, key_name) as k:
+                        try:
+                            display, _ = winreg.QueryValueEx(k, "DisplayName")
+                        except OSError:
+                            continue
+                        display = str(display or "").strip()
+                        if not display or "Update" in display:
+                            continue
+                        exe = ""
+                        try:
+                            icon, _ = winreg.QueryValueEx(k, "DisplayIcon")
+                            icon = str(icon or "").split(",")[0].strip().strip('"')
+                            if icon.lower().endswith(".exe") and Path(icon).is_file():
+                                exe = icon
+                        except OSError:
+                            pass
+                        if not exe:
+                            continue
+                        apps.append({
+                            "id": "uninst:" + key_name.lower()[:100],
+                            "name": display[:80],
+                            "command": f'"{exe}"' if " " in exe else exe,
+                            "kind": "uninstall",
+                            "icon": None,
+                        })
+                except OSError:
+                    continue
+                if len(apps) >= 200:
+                    break
+            try:
+                winreg.CloseKey(base)
+            except OSError:
+                pass
+    return apps

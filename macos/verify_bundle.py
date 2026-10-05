@@ -112,8 +112,8 @@ def main() -> None:
         if not (mac / "runtime" / name).is_file():
             raise SystemExit(f"missing runtime/{name}")
     index = (mac / "web" / "index.html").read_text(encoding="utf-8")
-    if "app.js?v=25" not in index:
-        raise SystemExit("web cache is not v=25")
+    if "app.js?v=27" not in index:
+        raise SystemExit("web cache is not v=26")
     plist = (app / "Contents" / "Info.plist").read_text(encoding="utf-8")
     if "Laden AS" not in plist:
         raise SystemExit("publisher is not Laden AS")

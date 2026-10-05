@@ -5,6 +5,8 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
+from pathlib import Path
 import shlex
 import shutil
 import subprocess
@@ -1376,3 +1378,155 @@ def _pam_auth(pam: ctypes.CDLL, service: bytes, user: str, password: str) -> boo
         return pam.pam_authenticate(handle, 0) == pam_success
     finally:
         pam.pam_end(handle, 0)
+
+def detect_defaults() -> dict:
+    browser_choices = _mac_browser_choices()
+    terminal_choices = _mac_terminal_choices()
+    browser = _mac_default_browser(browser_choices) or (browser_choices[0] if browser_choices else {"id": "safari", "name": "Safari", "command": "open -a Safari https://www.google.com"})
+    terminal = _mac_default_terminal(terminal_choices) or (terminal_choices[0] if terminal_choices else {"id": "terminal", "name": "Terminal", "command": "open -a Terminal"})
+    return {
+        "ok": True,
+        "platform": "darwin",
+        "browser": browser,
+        "terminal": terminal,
+        "browserChoices": browser_choices,
+        "terminalChoices": terminal_choices,
+        "terminalAvailable": True,
+    }
+
+
+def list_installed_apps() -> dict:
+    apps = []
+    seen = set()
+    for root in (Path("/Applications"), Path.home() / "Applications"):
+        if not root.is_dir():
+            continue
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if len(apps) >= 400:
+                break
+            if not entry.name.endswith(".app") or not entry.is_dir():
+                continue
+            name = entry.stem
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            apps.append({
+                "id": "app:" + name,
+                "name": name[:80],
+                "command": 'open -a ' + _sh_quote(name),
+                "kind": "app",
+                "icon": None,
+            })
+    apps.sort(key=lambda r: r["name"].lower())
+    return {"ok": True, "platform": "darwin", "apps": apps, "suggestions": True}
+
+
+def _sh_quote(name: str) -> str:
+    if re.search(r'[^A-Za-z0-9._+-]', name):
+        return "'" + name.replace("'", "'\\''") + "'"
+    return name
+
+
+def _mac_app_exists(name: str) -> bool:
+    for root in (Path("/Applications"), Path.home() / "Applications", Path("/System/Applications")):
+        if (root / f"{name}.app").is_dir():
+            return True
+    return False
+
+
+def _mac_browser_choices() -> list:
+    known = [
+        ("safari", "Safari", "open -a Safari https://www.google.com"),
+        ("chrome", "Google Chrome", "open -a 'Google Chrome' https://www.google.com"),
+        ("firefox", "Firefox", "open -a Firefox https://www.google.com"),
+        ("edge", "Microsoft Edge", "open -a 'Microsoft Edge' https://www.google.com"),
+        ("brave", "Brave Browser", "open -a 'Brave Browser' https://www.google.com"),
+        ("arc", "Arc", "open -a Arc https://www.google.com"),
+        ("opera", "Opera", "open -a Opera https://www.google.com"),
+    ]
+    rows = []
+    for cid, name, cmd in known:
+        if _mac_app_exists(name) or cid == "safari":
+            rows.append({"id": cid, "name": name, "command": cmd})
+    rows.append({"id": "open-url", "name": "System default (open)", "command": "open https://www.google.com"})
+    return rows
+
+
+def _mac_terminal_choices() -> list:
+    known = [
+        ("terminal", "Terminal", "open -a Terminal"),
+        ("iterm", "iTerm", "open -a iTerm"),
+        ("warp", "Warp", "open -a Warp"),
+        ("wezterm", "WezTerm", "open -a WezTerm"),
+    ]
+    rows = []
+    for cid, name, cmd in known:
+        if _mac_app_exists(name) or cid == "terminal":
+            rows.append({"id": cid, "name": name, "command": cmd})
+    return rows
+
+
+def _mac_default_browser(choices: list) -> dict | None:
+    # LaunchServices default handler for http via lsregister / defaults / python.
+    handler = _mac_http_handler_id()
+    mapping = {
+        "com.apple.safari": "safari",
+        "com.google.chrome": "chrome",
+        "org.mozilla.firefox": "firefox",
+        "com.microsoft.edgemac": "edge",
+        "com.brave.browser": "brave",
+        "company.thebrowser.browser": "arc",
+        "com.operasoftware.opera": "opera",
+    }
+    want = mapping.get((handler or "").lower())
+    if want:
+        for row in choices:
+            if row["id"] == want:
+                return row
+    # Fallback: first installed known browser, else open.
+    for row in choices:
+        if row["id"] != "open-url":
+            return row
+    return None
+
+
+def _mac_default_terminal(choices: list) -> dict | None:
+    for cid in ("iterm", "warp", "wezterm", "terminal"):
+        for row in choices:
+            if row["id"] == cid:
+                return row
+    return choices[0] if choices else None
+
+
+def _mac_http_handler_id() -> str:
+    # Prefer Swift-less plutil/defaults dump of LaunchServices handlers.
+    try:
+        import plistlib
+        secure = Path.home() / "Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist"
+        legacy = Path.home() / "Library/Preferences/com.apple.LaunchServices.plist"
+        for path in (secure, legacy):
+            if not path.is_file():
+                continue
+            data = plistlib.loads(path.read_bytes())
+            for handler in data.get("LSHandlers") or []:
+                if handler.get("LSHandlerURLScheme") == "http" and handler.get("LSHandlerRoleAll"):
+                    return str(handler.get("LSHandlerRoleAll") or "")
+                if handler.get("LSHandlerContentType") == "public.html" and handler.get("LSHandlerRoleAll"):
+                    return str(handler.get("LSHandlerRoleAll") or "")
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(
+            ["osascript", "-e", 'id of app "Safari"'],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        ).strip()
+        return out
+    except (OSError, subprocess.SubprocessError):
+        return ""

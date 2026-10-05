@@ -76,7 +76,7 @@ document.addEventListener("keydown", (e) => {
   }
 })
 
-const setupUi = { step: "gate", email: "", password: "", confirm: "", username: "", city: "", picks: null, error: "", busy: false, localOnly: false, fresh: false, pendingRaw: "" }
+const setupUi = { step: "gate", email: "", password: "", confirm: "", username: "", city: "", picks: null, error: "", busy: false, localOnly: false, fresh: false, pendingRaw: "", defaults: null, catalog: null, catalogLoading: false, catalogError: "", search: "", manual: [], browserId: "", terminalId: "", core: null }
 let monitorsOn = false
 
 renderOpening()
@@ -1404,39 +1404,6 @@ function programCommand(command, label) {
   return text
 }
 
-function installPrograms(platform) {
-  if (platform === "iphone" || platform === "android") {
-    return [
-      ["laden", "Laden", "https://laden.no", "#00ff9d"],
-      ["maps", "Maps", "https://maps.google.com", "#00e5ff"],
-      ["mail", "Mail", "https://mail.google.com", "#ffd166"],
-      ["notes", "Notes", "https://keep.google.com", "#a78bfa"],
-    ]
-  }
-  if (platform === "win32") {
-    return [
-      ["terminal", "Terminal", "wt", "#00e5ff"],
-      ["files", "Files", "explorer", "#ffd166"],
-      ["laden", "Laden", "https://laden.no", "#00ff9d"],
-      ["browser", "Browser", "https://www.google.com", "#a78bfa"],
-    ]
-  }
-  if (platform === "darwin") {
-    return [
-      ["terminal", "Terminal", "open -a Terminal", "#00e5ff"],
-      ["files", "Files", "open ~", "#ffd166"],
-      ["laden", "Laden", "open https://laden.no", "#00ff9d"],
-      ["browser", "Browser", "open https://www.google.com", "#a78bfa"],
-    ]
-  }
-  return [
-    ["terminal", "Terminal", "wezterm || kitty || konsole", "#00e5ff"],
-    ["files", "Files", "xdg-open ~", "#ffd166"],
-    ["laden", "Laden", "xdg-open https://laden.no", "#00ff9d"],
-    ["dolphin", "Dolphin", "dolphin", "#a78bfa"],
-  ]
-}
-
 function showDragCatch() {
   const catcher = document.getElementById("drag-catch")
   if (!catcher) return
@@ -1712,30 +1679,266 @@ function setupNameStep() {
   return box
 }
 
+function coreSetupPrograms(platform, defaults) {
+  const browser = defaults?.browser || null
+  const terminal = defaults?.terminal || null
+  const browserCmd = browser?.command || programCommand("", "browser")
+  const terminalCmd = terminal?.command || (
+    platform === "win32" ? "wt" :
+    platform === "darwin" ? "open -a Terminal" :
+    platform === "android" || platform === "iphone" ? "" :
+    "x-terminal-emulator"
+  )
+  const rows = []
+  if (platform !== "android" && platform !== "iphone" && terminalCmd) {
+    rows.push(["terminal", terminal?.name || "Terminal", terminalCmd, "#00e5ff"])
+  }
+  if (platform === "win32") {
+    rows.push(["files", "Files", "explorer", "#ffd166"])
+  } else if (platform === "darwin") {
+    rows.push(["files", "Files", "open ~", "#ffd166"])
+  } else if (platform !== "android" && platform !== "iphone") {
+    rows.push(["files", "Files", "xdg-open ~", "#ffd166"])
+  }
+  rows.push(["laden", "Laden", platform === "darwin" ? "open https://laden.no" : platform === "win32" ? "start https://laden.no" : "https://laden.no", "#00ff9d"])
+  rows.push(["browser", browser?.name || "Browser", browserCmd || "https://www.google.com", "#a78bfa"])
+  if (platform === "android" || platform === "iphone") {
+    return [
+      ["laden", "Laden", "https://laden.no", "#00ff9d"],
+      ["browser", browser?.name || "Browser", browserCmd || "https://www.google.com", "#a78bfa"],
+      ["maps", "Maps", "https://maps.google.com", "#00e5ff"],
+      ["mail", "Mail", "https://mail.google.com", "#ffd166"],
+    ]
+  }
+  return rows
+}
+
+function installPrograms(platform) {
+  return coreSetupPrograms(platform, null)
+}
+
 function setupProgramStep() {
-  const choices = installPrograms(state._platform || "")
-  if (!setupUi.picks) setupUi.picks = Object.fromEntries(choices.map((row) => [row[0], true]))
   const box = h("div", { class: "setup-step" })
-  const picks = h("div", { class: "setup-picks" })
-  for (const [id, label, command] of choices) {
+  if (!setupUi.catalogLoading && setupUi.defaults == null && setupUi.catalog == null) {
+    setupUi.catalogLoading = true
+    void loadSetupPrograms()
+  }
+  if (setupUi.catalogLoading) {
+    box.append(h("p", { class: "hint" }, ["Looking for the default browser, terminal, and installed apps on this device…"]))
+    return box
+  }
+  if (setupUi.catalogError) {
+    box.append(h("p", { class: "hint" }, [setupUi.catalogError]))
+  }
+  const defaults = setupUi.defaults || { browserChoices: [], terminalChoices: [], terminalAvailable: false }
+  const platform = state._platform || defaults.platform || ""
+  if (!setupUi.core) setupUi.core = coreSetupPrograms(platform, defaults)
+  if (!setupUi.picks) {
+    setupUi.picks = Object.fromEntries(setupUi.core.map((row) => [row[0], true]))
+  }
+  if (!setupUi.browserId && defaults.browser) setupUi.browserId = defaults.browser.id
+  if (!setupUi.terminalId && defaults.terminal) setupUi.terminalId = defaults.terminal.id
+
+  // Browser / terminal overrides
+  const tools = h("div", { class: "setup-tools" })
+  tools.append(h("p", { class: "hint" }, ["Detected for this OS. Change them if you want — nothing is saved until you confirm."]))
+  if ((defaults.browserChoices || []).length) {
+    const sel = h("select")
+    for (const row of defaults.browserChoices) {
+      const opt = h("option", { value: row.id }, [row.name])
+      if (row.id === setupUi.browserId) opt.selected = true
+      sel.append(opt)
+    }
+    sel.onchange = () => {
+      setupUi.browserId = sel.value
+      const choice = (defaults.browserChoices || []).find((r) => r.id === sel.value)
+      if (choice) {
+        const idx = setupUi.core.findIndex((r) => r[0] === "browser")
+        if (idx >= 0) setupUi.core[idx] = ["browser", choice.name, choice.command, "#a78bfa"]
+        else setupUi.core.push(["browser", choice.name, choice.command, "#a78bfa"])
+        setupUi.picks.browser = true
+      }
+      renderSetup()
+    }
+    tools.append(field("Browser", sel))
+  }
+  if (defaults.terminalAvailable !== false && (defaults.terminalChoices || []).length) {
+    const sel = h("select")
+    for (const row of defaults.terminalChoices) {
+      const opt = h("option", { value: row.id }, [row.name])
+      if (row.id === setupUi.terminalId) opt.selected = true
+      sel.append(opt)
+    }
+    sel.onchange = () => {
+      setupUi.terminalId = sel.value
+      const choice = (defaults.terminalChoices || []).find((r) => r.id === sel.value)
+      if (choice) {
+        const idx = setupUi.core.findIndex((r) => r[0] === "terminal")
+        if (idx >= 0) setupUi.core[idx] = ["terminal", choice.name, choice.command, "#00e5ff"]
+        else setupUi.core.push(["terminal", choice.name, choice.command, "#00e5ff"])
+        setupUi.picks.terminal = true
+      }
+      renderSetup()
+    }
+    tools.append(field("Terminal", sel))
+  } else if (platform === "android" || platform === "iphone") {
+    tools.append(h("p", { class: "hint" }, ["No system terminal on this device" + (defaults.termux ? " (Termux is installed — add it below if you want)." : ".")]))
+  }
+  box.append(tools)
+
+  // Core checklist
+  const coreBox = h("div", { class: "setup-picks" })
+  coreBox.append(h("p", { class: "mono muted" }, ["Basics"]))
+  for (const [id, label, command] of setupUi.core) {
     const input = h("input", { type: "checkbox" })
     input.checked = setupUi.picks[id] !== false
     input.onchange = () => { setupUi.picks[id] = input.checked }
-    picks.append(h("label", { class: "setup-pick" }, [
+    coreBox.append(h("label", { class: "setup-pick" }, [
       input,
       h("span", {}, [label]),
       h("span", { class: "mono muted" }, [programCommand(command, label)]),
     ]))
   }
-  box.append(h("p", { class: "hint" }, ["These land on the Programs panel. You can change them later in Control."]), picks)
+  box.append(coreBox)
+
+  // Installed apps searchable checklist
+  const catalog = setupUi.catalog || []
+  const suggest = h("div", { class: "setup-suggest" })
+  suggest.append(h("p", { class: "mono muted" }, ["Installed apps"]))
+  suggest.append(h("p", { class: "hint" }, [
+    catalog.length
+      ? "Pick apps already on this machine. The list stays on this device until you confirm and write vault.conf."
+      : (defaults.suggestions === false
+        ? "Installed-app suggestions are not available here. You can still add programs manually."
+        : "No app listings found. Add programs manually below."),
+  ]))
+  if (catalog.length) {
+    const search = h("input", { type: "search", placeholder: "Search installed apps", value: setupUi.search || "" })
+    search.oninput = () => {
+      setupUi.search = search.value
+      // Rebuild list only — avoid full setup remount losing focus: update children
+      fillCatalogList(list, catalog, setupUi.search)
+    }
+    suggest.append(search)
+    const list = h("div", { class: "setup-picks setup-catalog" })
+    fillCatalogList(list, catalog, setupUi.search)
+    suggest.append(list)
+  }
+  box.append(suggest)
+
+  // Manual add
+  const manual = h("div", { class: "setup-manual" })
+  manual.append(h("p", { class: "mono muted" }, ["Manual add"]))
+  const nameIn = h("input", { placeholder: "Name" })
+  const cmdIn = h("input", { placeholder: "Command, path, or https://…" })
+  const argsIn = h("input", { placeholder: "Optional args" })
+  manual.append(h("div", { class: "inline" }, [nameIn, cmdIn]))
+  manual.append(argsIn)
+  manual.append(h("button", { class: "btn btn-ghost", type: "button", onclick: () => {
+    const label = nameIn.value.trim()
+    let command = cmdIn.value.trim()
+    const args = argsIn.value.trim()
+    if (!label || !command) {
+      setupUi.error = "Manual add needs a name and a command, path, or URL."
+      renderSetup()
+      return
+    }
+    if (args) command = command + " " + args
+    const id = "manual:" + uid()
+    setupUi.manual.push({ id, label, command, color: "#00ff9d" })
+    setupUi.picks[id] = true
+    setupUi.error = ""
+    nameIn.value = ""
+    cmdIn.value = ""
+    argsIn.value = ""
+    renderSetup()
+  } }, ["Add"]))
+  if (setupUi.manual.length) {
+    const mine = h("div", { class: "setup-picks" })
+    for (const row of setupUi.manual) {
+      const input = h("input", { type: "checkbox" })
+      input.checked = setupUi.picks[row.id] !== false
+      input.onchange = () => { setupUi.picks[row.id] = input.checked }
+      mine.append(h("label", { class: "setup-pick" }, [
+        input,
+        h("span", {}, [row.label]),
+        h("span", { class: "mono muted" }, [row.command]),
+      ]))
+    }
+    manual.append(mine)
+  }
+  box.append(manual)
+
   box.append(h("div", { class: "inline" }, [
     h("button", { class: "btn btn-ghost", type: "button", onclick: () => { setupUi.step = "name"; setupUi.error = ""; renderSetup() } }, ["Back"]),
-    h("button", { class: "btn btn-primary", type: "button", onclick: () => { if (!setupUi.busy) finishSetup(choices) } }, [setupUi.busy ? "Creating…" : "Open Ldash"]),
+    h("button", { class: "btn btn-primary", type: "button", onclick: () => { if (!setupUi.busy) finishSetup() } }, [setupUi.busy ? "Creating…" : "Open Ldash"]),
   ]))
+  box.append(h("p", { class: "hint" }, ["Selected programs go into the first vault.conf. Cloud upload waits until that file exists and you are not on read-only standby."]))
   return box
 }
 
-async function finishSetup(choices) {
+function fillCatalogList(list, catalog, query) {
+  const q = String(query || "").trim().toLowerCase()
+  list.replaceChildren()
+  let shown = 0
+  for (const app of catalog) {
+    if (q && !String(app.name || "").toLowerCase().includes(q) && !String(app.command || "").toLowerCase().includes(q)) continue
+    const id = app.id
+    const input = h("input", { type: "checkbox" })
+    input.checked = setupUi.picks[id] === true
+    input.onchange = () => { setupUi.picks[id] = input.checked }
+    const icon = h("span", { class: "setup-app-icon", "aria-hidden": "true" }, [(app.name || "?").slice(0, 1).toUpperCase()])
+    list.append(h("label", { class: "setup-pick" }, [
+      input,
+      icon,
+      h("span", {}, [
+        h("span", {}, [app.name || id]),
+        h("span", { class: "mono muted", style: "display:block" }, [app.command || ""]),
+      ]),
+    ]))
+    shown += 1
+    if (shown >= 80) {
+      list.append(h("p", { class: "hint" }, ["Showing the first 80 matches — refine the search."]))
+      break
+    }
+  }
+  if (!shown) list.append(h("p", { class: "empty" }, ["No matches."]))
+}
+
+async function loadSetupPrograms() {
+  setupUi.catalogLoading = true
+  setupUi.catalogError = ""
+  renderSetup()
+  try {
+    const [defaults, listed] = await Promise.all([
+      ladenCall("detectDefaults"),
+      ladenCall("listInstalledApps"),
+    ])
+    setupUi.defaults = defaults && defaults.ok !== false ? defaults : { ok: false, browserChoices: [], terminalChoices: [], terminalAvailable: false, suggestions: false }
+    if (listed && listed.ok !== false) {
+      setupUi.catalog = Array.isArray(listed.apps) ? listed.apps : []
+      if (setupUi.defaults) setupUi.defaults.suggestions = listed.suggestions !== false
+      if (listed.termux) setupUi.defaults.termux = true
+    } else {
+      setupUi.catalog = []
+      setupUi.catalogError = (listed && listed.error) || "Could not list installed apps. You can still pick the basics or add programs manually."
+      if (setupUi.defaults) setupUi.defaults.suggestions = false
+    }
+    if (defaults && defaults.ok === false) {
+      setupUi.catalogError = (setupUi.catalogError ? setupUi.catalogError + " " : "") + (defaults.error || "Could not detect defaults.")
+    }
+  } catch (err) {
+    setupUi.defaults = { ok: false, browserChoices: [], terminalChoices: [], terminalAvailable: false, suggestions: false }
+    setupUi.catalog = []
+    setupUi.catalogError = String(err && err.message || err)
+  }
+  setupUi.catalogLoading = false
+  setupUi.core = null
+  setupUi.picks = null
+  renderSetup()
+}
+
+async function finishSetup() {
   if (setupUi.busy) return
   if (state._localVault) {
     setupUi.error = "This device already has a vault.conf."
@@ -1743,9 +1946,24 @@ async function finishSetup(choices) {
     renderSetup()
     return
   }
-  const picked = choices.filter((row) => setupUi.picks[row[0]] !== false)
+  const picked = []
+  for (const row of (setupUi.core || [])) {
+    if (setupUi.picks[row[0]] !== false) {
+      picked.push({ label: row[1], command: programCommand(row[2], row[1]), color: row[3] })
+    }
+  }
+  for (const app of (setupUi.catalog || [])) {
+    if (setupUi.picks[app.id] === true) {
+      picked.push({ label: app.name, command: app.command, color: "#a78bfa" })
+    }
+  }
+  for (const row of (setupUi.manual || [])) {
+    if (setupUi.picks[row.id] !== false) {
+      picked.push({ label: row.label, command: row.command, color: row.color || "#00ff9d" })
+    }
+  }
   if (!picked.length) {
-    setupUi.error = "Pick at least one program."
+    setupUi.error = "Pick at least one program, or add one manually."
     renderSetup()
     return
   }
@@ -1762,7 +1980,7 @@ async function finishSetup(choices) {
     state.settings.localOnly = !!setupUi.localOnly
     state.settings.setupDone = true
     sessionSecret = password
-    state.apps = picked.map((row) => ({ id: uid(), label: row[1], command: programCommand(row[2], row[1]), color: row[3] }))
+    state.apps = picked.map((row) => ({ id: uid(), label: row.label, command: row.command, color: row.color }))
     const made = await ladenCall("prepareUserFolder", { email: setupUi.email, username: setupUi.username })
     if (made && made.ok === false && !/unknown method/i.test(String(made.error || ""))) {
       state.settings.setupDone = false

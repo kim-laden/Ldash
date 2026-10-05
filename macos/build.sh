@@ -71,6 +71,7 @@ assemble() {
   cp "$DASH/windows/serve.py" "$mac/runtime/serve.py"
   cp "$DASH/host.py" "$mac/runtime/host.py"
   cp "$DASH/machost.py" "$mac/runtime/machost.py"
+  cp "$DASH/appsdetect.py" "$mac/runtime/appsdetect.py"
   cp "$ROOT/build/cache/cacert.pem" "$mac/runtime/cacert.pem"
   mkdir -p "$mac/web"
   cp "$DASH/web/index.html" "$DASH/web/app.js" "$DASH/web/vault.js" "$DASH/web/journal.js" \

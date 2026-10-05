@@ -536,6 +536,10 @@ class OpsApp(Gtk.Application):
             return self.host.get_windows()
         if method == "launch":
             return self.host.launch(str(params.get("command") or ""))
+        if method == "detectDefaults":
+            return self.host.detect_defaults()
+        if method == "listInstalledApps":
+            return self.host.list_installed_apps()
         if method == "fetch":
             return self.host.fetch(str(params.get("url") or ""))
         if method == "localUser":

@@ -2,6 +2,8 @@ package org.laden.opsdash
 
 import android.app.ActivityManager
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import androidx.appcompat.app.AppCompatActivity
@@ -94,6 +96,8 @@ class PhoneHost(private val context: Context, private val chrome: PhoneChrome) {
                 "accountFetch" -> accountFetch(params)
                 "windowSnap" -> JSONObject().put("ok", true).put("mode", "off").put("supported", false)
                 "setWindowSnap" -> JSONObject().put("ok", true).put("mode", str(params, "mode").ifBlank { "off" }).put("supported", false)
+                "detectDefaults" -> detectDefaults()
+                "listInstalledApps" -> listInstalledApps()
                 else -> fail("unknown method $method")
             }
         } catch (exc: Exception) {
@@ -186,16 +190,122 @@ class PhoneHost(private val context: Context, private val chrome: PhoneChrome) {
         }
     }
 
-    /** Web links only. A stored command is not run. */
+    /** Web links, or package:id for an installed launcher app. Shell commands are not run. */
     private fun openLink(command: String): JSONObject {
         val trimmed = command.trim()
+        if (trimmed.startsWith("package:")) {
+            val pkg = trimmed.removePrefix("package:").trim()
+            if (pkg.isEmpty()) return fail("empty package")
+            val launch = context.packageManager.getLaunchIntentForPackage(pkg)
+                ?: return fail("That app is not installed.")
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(launch)
+            return JSONObject().put("ok", true)
+        }
         val uri = Uri.parse(trimmed)
         val scheme = uri.scheme?.lowercase()
         if ((scheme != "http" && scheme != "https") || uri.host.isNullOrEmpty()) {
-            return fail("Only web links open on Android.")
+            return fail("Only web links or package:id open on Android.")
         }
         chrome.openWeb(uri)
         return JSONObject().put("ok", true)
+    }
+
+    private fun detectDefaults(): JSONObject {
+        val pm = context.packageManager
+        val view = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com"))
+        val resolved = pm.resolveActivity(view, PackageManager.MATCH_DEFAULT_ONLY)
+        val browserChoices = JSONArray()
+        val browsers = pm.queryIntentActivities(view, PackageManager.MATCH_ALL)
+            .distinctBy { it.activityInfo.packageName }
+            .sortedBy { it.loadLabel(pm).toString().lowercase(Locale.US) }
+        var defaultId = ""
+        var defaultName = "Browser"
+        var defaultCmd = "https://www.google.com"
+        for (info in browsers) {
+            val pkg = info.activityInfo.packageName
+            val name = info.loadLabel(pm).toString()
+            val id = "package:$pkg"
+            val cmd = "package:$pkg"
+            browserChoices.put(JSONObject().put("id", id).put("name", name).put("command", cmd))
+            if (resolved != null && resolved.activityInfo.packageName == pkg) {
+                defaultId = id
+                defaultName = name
+                defaultCmd = cmd
+            }
+        }
+        if (defaultId.isEmpty() && browserChoices.length() > 0) {
+            val first = browserChoices.getJSONObject(0)
+            defaultId = first.getString("id")
+            defaultName = first.getString("name")
+            defaultCmd = first.getString("command")
+        }
+        browserChoices.put(JSONObject().put("id", "https").put("name", "System default (https)").put("command", "https://www.google.com"))
+        if (defaultId.isEmpty()) {
+            defaultId = "https"
+            defaultCmd = "https://www.google.com"
+        }
+        val termux = try {
+            pm.getPackageInfo("com.termux", 0)
+            true
+        } catch (_: Exception) {
+            false
+        }
+        return JSONObject()
+            .put("ok", true)
+            .put("platform", "android")
+            .put("browser", JSONObject().put("id", defaultId).put("name", defaultName).put("command", defaultCmd))
+            .put("terminal", JSONObject.NULL)
+            .put("browserChoices", browserChoices)
+            .put("terminalChoices", JSONArray())
+            .put("terminalAvailable", false)
+            .put("termux", termux)
+    }
+
+    private fun listInstalledApps(): JSONObject {
+        val pm = context.packageManager
+        val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val found = try {
+            pm.queryIntentActivities(main, PackageManager.MATCH_ALL)
+        } catch (_: Exception) {
+            emptyList()
+        }
+        val apps = JSONArray()
+        val seen = HashSet<String>()
+        for (info in found.sortedBy { it.loadLabel(pm).toString().lowercase(Locale.US) }) {
+            val pkg = info.activityInfo.packageName
+            if (pkg == context.packageName || !seen.add(pkg)) continue
+            val name = info.loadLabel(pm).toString()
+            apps.put(
+                JSONObject()
+                    .put("id", "package:$pkg")
+                    .put("name", name)
+                    .put("command", "package:$pkg")
+                    .put("kind", "launcher")
+                    .put("icon", JSONObject.NULL)
+            )
+            if (apps.length() >= 400) break
+        }
+        try {
+            pm.getPackageInfo("com.termux", 0)
+            if (seen.add("com.termux")) {
+                apps.put(
+                    JSONObject()
+                        .put("id", "package:com.termux")
+                        .put("name", "Termux")
+                        .put("command", "package:com.termux")
+                        .put("kind", "termux")
+                        .put("icon", JSONObject.NULL)
+                )
+            }
+        } catch (_: Exception) {
+        }
+        return JSONObject()
+            .put("ok", true)
+            .put("platform", "android")
+            .put("apps", apps)
+            .put("suggestions", true)
+            .put("termux", seen.contains("com.termux") || apps.toString().contains("com.termux"))
     }
 
     private fun openPath(target: String): JSONObject {

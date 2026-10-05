@@ -30,7 +30,7 @@ mkdir -p "$STAGE/runtime" "$STAGE/web" "$STAGE/redist" "$DIST"
 cp -a "$ROOT/build/publish/." "$STAGE/"
 cp -a "$ROOT/../web/." "$STAGE/web/"
 cp "$ROOT/laden.ico" "$STAGE/laden.ico"
-cp "$ROOT/serve.py" "$ROOT/../host.py" "$ROOT/../winhost.py" "$STAGE/runtime/"
+cp "$ROOT/serve.py" "$ROOT/../host.py" "$ROOT/../winhost.py" "$ROOT/../appsdetect.py" "$STAGE/runtime/"
 
 if [ ! -f "$ROOT/build/$PY_ZIP" ]; then
   curl -fL --retry 3 -o "$ROOT/build/$PY_ZIP" "$PY_URL"
