@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>LadenOps</AssemblyName>
+    <RootNamespace>LadenOps</RootNamespace>
+    <Version>1.0.0</Version>
+    <Company>Laden AS</Company>
+    <Product>Ldash</Product>
+    <Copyright>Copyright © Laden AS</Copyright>
+    <AssemblyTitle>Laden Ops</AssemblyTitle>
+    <SelfContained>true</SelfContained>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Photino.NET" Version="4.0.16" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,54 @@
+#!/bin/bash
+# Runs on the Mac as root after the staged apps are copied into place.
+set -e
+ARCH="$(uname -m)"
+case "$ARCH" in
+  arm64) SRC="/Library/Application Support/laden-ops-setup/arm64/Laden Ops.app" ;;
+  x86_64) SRC="/Library/Application Support/laden-ops-setup/x64/Laden Ops.app" ;;
+  *) echo "Laden Ops needs an Apple Silicon or Intel Mac, not $ARCH." >&2; exit 1 ;;
+esac
+if [ ! -d "$SRC" ]; then
+  echo "The $ARCH app is missing from the installer." >&2
+  exit 1
+fi
+DEST="/Applications/Laden Ops.app"
+rm -rf "$DEST"
+ditto "$SRC" "$DEST"
+chown -R root:wheel "$DEST"
+chmod -R a+rX "$DEST"
+rm -rf "/Library/Application Support/laden-ops-setup"
+
+CONSOLE="$(stat -f %Su /dev/console 2>/dev/null || true)"
+if [ -n "$CONSOLE" ] && [ "$CONSOLE" != "root" ]; then
+  HOME_DIR="$(dscl . -read "/Users/$CONSOLE" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+  UID_NUM="$(id -u "$CONSOLE")"
+  if [ -n "$HOME_DIR" ] && [ -n "$UID_NUM" ]; then
+    LAUNCH="$HOME_DIR/Library/LaunchAgents"
+    mkdir -p "$LAUNCH"
+    PLIST="$LAUNCH/org.laden.OpsDash.plist"
+    cat > "$PLIST" << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.laden.OpsDash</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/Laden Ops.app/Contents/MacOS/LadenOps</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+</dict>
+</plist>
+EOF
+    chown "$CONSOLE" "$LAUNCH" "$PLIST" || true
+    chmod 644 "$PLIST"
+    launchctl bootout "gui/$UID_NUM/org.laden.OpsDash" 2>/dev/null || true
+    sudo -u "$CONSOLE" launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null || true
+    sudo -u "$CONSOLE" open "$DEST" || true
+  fi
+fi
+exit 0
