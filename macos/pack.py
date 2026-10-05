@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import zlib
 from pathlib import Path
 
@@ -63,7 +64,7 @@ def count_tree(root: Path) -> tuple[int, int]:
 
 def package_info(count: int, kbytes: int) -> bytes:
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<pkg-info format-version="2" identifier="org.laden.OpsDash.installer" version="1.0.0" install-location="/" auth="root" overwrite-permissions="true">
+<pkg-info format-version="2" identifier="{PKG_ID}" version="{PKG_VERSION}" install-location="/" auth="root" overwrite-permissions="true">
   <payload numberOfFiles="{count}" installKBytes="{kbytes}"/>
   <scripts>
     <postinstall file="./postinstall"/>
@@ -77,41 +78,108 @@ def sha1(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
 
 
-def write_xar(path: Path, files: list[tuple[str, bytes]]) -> None:
-    """Uncompressed xar. The checksum is the SHA-1 of the TOC."""
-    offset = 20
-    parts: list[str] = []
-    blob = bytearray()
-    for index, (name, data) in enumerate(files, start=1):
-        digest = sha1(data)
-        parts.append(
-            f"""  <file id="{index}">
-    <name>{name}</name>
-    <type>file</type>
-    <mode>0644</mode>
-    <data>
-      <length>{len(data)}</length>
-      <offset>{offset}</offset>
-      <size>{len(data)}</size>
-      <encoding style="application/octet-stream"/>
-      <archived-checksum style="sha1">{digest}</archived-checksum>
-      <extracted-checksum style="sha1">{digest}</extracted-checksum>
-    </data>
-  </file>
+PKG_ID = "org.laden.OpsDash.installer"
+PKG_VERSION = "1.0.0"
+COMPONENT = "Ldash.pkg"
+
+
+def distribution(kbytes: int) -> bytes:
+    """productbuild-style Distribution for a product archive with one component."""
+    xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+  <title>Ldash</title>
+  <options customize="never" require-scripts="false" rootVolumeOnly="true" hostArchitectures="x86_64,arm64"/>
+  <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+  <volume-check>
+    <allowed-os-versions>
+      <os-version min="12.0"/>
+    </allowed-os-versions>
+  </volume-check>
+  <choices-outline>
+    <line choice="default">
+      <line choice="{PKG_ID}"/>
+    </line>
+  </choices-outline>
+  <choice id="default"/>
+  <choice id="{PKG_ID}" visible="false">
+    <pkg-ref id="{PKG_ID}"/>
+  </choice>
+  <pkg-ref id="{PKG_ID}" version="{PKG_VERSION}" onConclusion="none" installKBytes="{kbytes}">#{COMPONENT}</pkg-ref>
+</installer-gui-script>
 """
-        )
-        blob += data
-        offset += len(data)
+    return xml.encode("utf-8")
+
+
+# A tree entry is (name, bytes) for a file or (name, [entries]) for a directory.
+Entry = tuple
+
+
+def write_xar(path: Path, entries: list[Entry]) -> None:
+    """Write an uncompressed-data xar (the format pkgutil/Installer read).
+
+    Layout: 28-byte header, zlib TOC, heap. The TOC checksum is SHA-1 over the
+    *compressed* TOC bytes and is stored at heap offset 0 (20 bytes), so file
+    data starts at heap offset 20. Data is stored as-is
+    (application/octet-stream), so archived and extracted checksums are equal.
+    """
+    blob = bytearray()
+    offset = 20
+    next_id = 1
+    ctime = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def render(items: list[Entry], depth: int) -> str:
+        nonlocal offset, next_id
+        pad = "  " * depth
+        out = []
+        for name, value in items:
+            fid = next_id
+            next_id += 1
+            if isinstance(value, list):
+                out.append(
+                    f"{pad}<file id=\"{fid}\">\n"
+                    f"{pad}  <name>{name}</name>\n"
+                    f"{pad}  <type>directory</type>\n"
+                    f"{pad}  <mode>0755</mode>\n"
+                    + render(value, depth + 1)
+                    + f"{pad}</file>\n"
+                )
+                continue
+            data = bytes(value)
+            digest = sha1(data)
+            out.append(
+                f"{pad}<file id=\"{fid}\">\n"
+                f"{pad}  <name>{name}</name>\n"
+                f"{pad}  <type>file</type>\n"
+                f"{pad}  <mode>0644</mode>\n"
+                f"{pad}  <data>\n"
+                f"{pad}    <length>{len(data)}</length>\n"
+                f"{pad}    <offset>{offset}</offset>\n"
+                f"{pad}    <size>{len(data)}</size>\n"
+                f"{pad}    <encoding style=\"application/octet-stream\"/>\n"
+                f"{pad}    <archived-checksum style=\"sha1\">{digest}</archived-checksum>\n"
+                f"{pad}    <extracted-checksum style=\"sha1\">{digest}</extracted-checksum>\n"
+                f"{pad}  </data>\n"
+                f"{pad}</file>\n"
+            )
+            blob.extend(data)
+            offset += len(data)
+        return "".join(out)
+
+    body = render(entries, 2)
     toc = (
         '<?xml version="1.0" encoding="UTF-8"?>\n<xar>\n <toc>\n'
-        "  <checksum style=\"sha1\">\n   <offset>0</offset>\n   <size>20</size>\n  </checksum>\n"
-        + "".join(parts)
+        f"  <creation-time>{ctime}</creation-time>\n"
+        '  <checksum style="sha1">\n   <offset>0</offset>\n   <size>20</size>\n  </checksum>\n'
+        + body
         + " </toc>\n</xar>\n"
     ).encode("utf-8")
-    digest = hashlib.sha1(toc).digest()
-    comp = zlib.compress(toc)
+    comp = zlib.compress(toc, 9)
+    # The TOC checksum covers the compressed TOC exactly as stored on disk.
+    toc_digest = hashlib.sha1(comp).digest()
+    # magic 'xar!', header size 28, version 1, toc lengths, cksum_alg 1 = SHA-1
     header = struct.pack(">IHHQQI", 0x78617221, 28, 1, len(comp), len(toc), 1)
-    path.write_bytes(header + comp + digest + blob)
+    assert len(header) == 28 and len(toc_digest) == 20
+    path.write_bytes(header + comp + toc_digest + bytes(blob))
 
 
 def main() -> None:
@@ -143,12 +211,19 @@ def main() -> None:
                 os.chmod(path, 0o755)
             else:
                 os.chmod(path, 0o644)
+    # mkbom (bomutils) skips dotfiles, so the Bom must not miss any payload
+    # entry: drop empty ".empty" placeholders and refuse any other dotfile.
+    for dot in sorted(root.rglob(".*")):
+        if dot.name == ".empty" and dot.is_file() and dot.stat().st_size == 0:
+            dot.unlink()
+        else:
+            raise SystemExit(f"dotfile would be missing from the Bom: {dot}")
     count, kbytes = count_tree(root)
     flat = work / "flat"
     flat.mkdir()
     print(f"payload files={count} kbytes={kbytes}", flush=True)
     cpio_gz(root, flat / "Payload")
-    run([str(mkbom), str(root), str(flat / "Bom")])
+    run([str(mkbom), "-u", "0", "-g", "80", str(root), str(flat / "Bom")])
     bom = (flat / "Bom").read_bytes()
     if not bom.startswith(b"BOMStore"):
         raise SystemExit("mkbom did not write a BOMStore file")
@@ -165,10 +240,16 @@ def main() -> None:
     write_xar(
         out,
         [
-            ("Payload", (flat / "Payload").read_bytes()),
-            ("PackageInfo", (flat / "PackageInfo").read_bytes()),
-            ("Bom", (flat / "Bom").read_bytes()),
-            ("Scripts", (flat / "Scripts").read_bytes()),
+            ("Distribution", distribution(kbytes)),
+            (
+                COMPONENT,
+                [
+                    ("Bom", (flat / "Bom").read_bytes()),
+                    ("Payload", (flat / "Payload").read_bytes()),
+                    ("Scripts", (flat / "Scripts").read_bytes()),
+                    ("PackageInfo", (flat / "PackageInfo").read_bytes()),
+                ],
+            ),
         ],
     )
     print(f"wrote {out} ({out.stat().st_size} bytes)", flush=True)

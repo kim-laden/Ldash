@@ -20,7 +20,21 @@ internal static class Program
         if (!SingleInstance.Acquire(Path.Combine(config, "show.sock"), () => Current?.ShowFromOutside()))
             return;
         Current = new Shell(config);
-        Current.Run();
+        // Never leave serve.py running on 127.0.0.1 when the shell goes away.
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => Current?.KillBackendNow();
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            Current?.LogLine("unhandled: " + e.ExceptionObject);
+            Current?.KillBackendNow();
+        };
+        try
+        {
+            Current.Run();
+        }
+        finally
+        {
+            Current.KillBackendNow();
+        }
     }
 }
 
@@ -53,6 +67,9 @@ internal sealed class Shell
 
     private static readonly CarbonHandler HotkeyThunk = OnHotKey;
     private static readonly ReopenHandler ReopenThunk = OnReopen;
+    private static readonly BoolIdHandler TerminateAfterLastThunk = OnShouldTerminateAfterLastWindowClosed;
+    private static readonly BoolIdHandler ShouldCloseThunk = OnWindowShouldClose;
+    private static IntPtr _nsWindow;
     private static readonly DispatchFn MainThunk = OnMainThunk;
     private static readonly DragHandler DragThunk = OnDrag;
     private static readonly AcceptHandler AcceptThunk = OnAcceptFirstMouse;
@@ -66,8 +83,20 @@ internal sealed class Shell
         (_width, _height) = ReadSize();
     }
 
+    private static readonly TimeSpan BackendTimeout = TimeSpan.FromSeconds(45);
+    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _stderrTail = new();
+    private bool _backendOk;
+    private bool _servicesStarted;
+    private int _retrying;
+
+    private sealed record BootResult(bool Ok, string Port, string Token, string Error);
+
     public void Run()
     {
+        // Photino needs StartUrl or StartString before WaitForClose creates the
+        // native window. Start the backend first and wait for its PORT/TOKEN
+        // lines, then open the window on the real URL, or on an error page.
+        var boot = StartBackendBlocking();
         var window = new PhotinoWindow()
             .SetTitle("Laden Ops")
             .SetUseOsDefaultSize(false)
@@ -84,18 +113,54 @@ internal sealed class Shell
             .Center()
             .RegisterWindowCreatedHandler((_, _) =>
             {
-                OnMain(InstallFrame);
-                _ = Task.Run(Boot);
+                // Photino raises this on the main (AppKit) thread.
+                try
+                {
+                    RememberWindow();
+                    InstallLifecycle();
+                    InstallFrame();
+                    if (_backendOk) StartServices();
+                }
+                catch (Exception ex)
+                {
+                    Log("window created: " + ex);
+                }
             })
             .RegisterWindowClosingHandler((_, _) =>
             {
-                if (_quitting) return true;
+                // On macOS Photino raises this from windowWillClose (too late to
+                // cancel); windowShouldClose: below is what turns close into hide.
+                if (_quitting || !_backendOk) return true;
                 HideWindow();
                 return false;
+            })
+            .RegisterWebMessageReceivedHandler((_, message) =>
+            {
+                try
+                {
+                    OnWebMessage(message);
+                }
+                catch (Exception ex)
+                {
+                    Log("web message: " + ex);
+                }
             })
             .RegisterSizeChangedHandler((_, size) => SaveSize(size.Width, size.Height));
         var icon = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "Resources", "laden.icns"));
         if (File.Exists(icon)) window.SetIconFile(icon);
+
+        var startSet = false;
+        if (boot.Ok && Uri.TryCreate($"http://127.0.0.1:{boot.Port}/", UriKind.Absolute, out var start))
+        {
+            ApplyBoot(boot);
+            window.Load(start);
+            startSet = true;
+        }
+        if (!startSet)
+        {
+            _backendOk = false;
+            window.LoadRawString(ErrorPage(boot.Ok ? "The dashboard runtime reported an invalid port." : boot.Error));
+        }
         _window = window;
         window.WaitForClose();
         Shutdown();
@@ -107,54 +172,126 @@ internal sealed class Shell
         OnMain(ShowPending);
     }
 
-    private async Task Boot()
+    private void ApplyBoot(BootResult boot)
     {
-        try
+        _origin = $"http://127.0.0.1:{boot.Port}";
+        _http?.Dispose();
+        _http = new HttpClient { Timeout = TimeSpan.FromSeconds(40) };
+        _http.DefaultRequestHeaders.Add("X-Laden-Token", boot.Token);
+        _backendOk = true;
+    }
+
+    // Runs on the main thread once the window exists and the backend is up.
+    private void StartServices()
+    {
+        if (_servicesStarted || !_backendOk) return;
+        _servicesStarted = true;
+        _loop = new CancellationTokenSource();
+        var token = _loop.Token;
+        _ = Task.Run(() => ControlLoop(token));
+        InstallReopen();
+        BindHotkey();
+        WatchShortcutFile();
+        if (_pendingShow) ShowWindow();
+    }
+
+    private void OnWebMessage(string? message)
+    {
+        var text = (message ?? "").Trim();
+        if (text == "laden:quit")
         {
-            var (port, token) = await StartBackend();
-            _origin = $"http://127.0.0.1:{port}";
-            _http = new HttpClient { Timeout = TimeSpan.FromSeconds(40) };
-            _http.DefaultRequestHeaders.Add("X-Laden-Token", token);
-            _loop = new CancellationTokenSource();
-            _ = Task.Run(() => ControlLoop(_loop.Token));
             OnMain(() =>
             {
-                InstallReopen();
-                BindHotkey();
-                WatchShortcutFile();
-                _window?.Load(_origin + "/");
-                if (_pendingShow) ShowWindow();
-            });
-        }
-        catch (Exception ex)
-        {
-            Log(ex.ToString());
-            OnMain(() =>
-            {
-                try
-                {
-                    _window?.ShowMessage("Laden Ops", ex.Message, PhotinoDialogButtons.Ok, PhotinoDialogIcon.Error);
-                }
-                catch (Exception)
-                {
-                }
                 _quitting = true;
                 _window?.Close();
             });
         }
+        else if (text == "laden:retry" && !_backendOk && Interlocked.Exchange(ref _retrying, 1) == 0)
+        {
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    var boot = StartBackendBlocking();
+                    OnMain(() =>
+                    {
+                        if (boot.Ok && Uri.TryCreate($"http://127.0.0.1:{boot.Port}/", UriKind.Absolute, out var url))
+                        {
+                            ApplyBoot(boot);
+                            _window?.Load(url);
+                            StartServices();
+                        }
+                        else
+                        {
+                            _window?.LoadRawString(ErrorPage(boot.Ok ? "The dashboard runtime reported an invalid port." : boot.Error));
+                        }
+                    });
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _retrying, 0);
+                }
+            });
+        }
     }
 
-    private async Task<(string port, string token)> StartBackend()
+    private BootResult StartBackendBlocking()
     {
+        try
+        {
+            return StartBackend(BackendTimeout).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Log("backend start failed: " + ex);
+            StopBackend();
+            return new BootResult(false, "", "", ex.Message);
+        }
+    }
+
+    internal void KillBackendNow() => StopBackend();
+
+    internal void LogLine(string line) => Log(line);
+
+    private void StopBackend()
+    {
+        var old = _backend;
+        _backend = null;
+        if (old == null) return;
+        try
+        {
+            if (!old.HasExited) old.Kill(entireProcessTree: true);
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    internal static string? FindPython(string baseDir, string arch)
+    {
+        var prefix = Path.Combine(baseDir, "runtime", arch);
+        return new[] { "python3", "python3.12" }
+            .Select(name => Path.Combine(prefix, "bin", name))
+            .FirstOrDefault(File.Exists);
+    }
+
+    private async Task<BootResult> StartBackend(TimeSpan timeout)
+    {
+        StopBackend();
+        while (_stderrTail.TryDequeue(out string? _))
+        {
+        }
+        // AppContext.BaseDirectory is Contents/MacOS/ inside the bundle, also
+        // when launchd starts us with cwd "/" and a minimal environment.
         var baseDir = AppContext.BaseDirectory;
         var arch = RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "arm64" : "x64";
         var prefix = Path.Combine(baseDir, "runtime", arch);
-        var python = new[] { "python3", "python3.12" }
-            .Select(name => Path.Combine(prefix, "bin", name))
-            .FirstOrDefault(File.Exists);
+        var python = FindPython(baseDir, arch);
         var serve = Path.Combine(baseDir, "runtime", "serve.py");
-        if (python == null || !File.Exists(serve))
-            throw new FileNotFoundException("The bundled runtime is missing. Reinstall Laden Ops.");
+        if (python == null)
+            return new BootResult(false, "", "", $"The bundled Python runtime is missing ({prefix}/bin). Reinstall Laden Ops.");
+        if (!File.Exists(serve))
+            return new BootResult(false, "", "", $"The dashboard server is missing ({serve}). Reinstall Laden Ops.");
 
         var psi = new ProcessStartInfo(python)
         {
@@ -162,41 +299,77 @@ internal sealed class Shell
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            RedirectStandardInput = false,
         };
         psi.ArgumentList.Add("-u");
         psi.ArgumentList.Add(serve);
+        psi.Environment.Remove("PYTHONPATH");
+        psi.Environment.Remove("PYTHONSTARTUP");
         psi.Environment["PYTHONUNBUFFERED"] = "1";
         psi.Environment["PYTHONIOENCODING"] = "utf-8";
+        psi.Environment["PYTHONUTF8"] = "1";
         psi.Environment["PYTHONNOUSERSITE"] = "1";
         psi.Environment["PYTHONHOME"] = prefix;
+        // serve.py exits by itself if this process disappears (crash, SIGKILL).
+        psi.Environment["LADEN_PARENT_PID"] = Environment.ProcessId.ToString();
+        // A LaunchAgent gets no shell profile: make sure the tools host.py and
+        // machost.py call (ioreg, sysctl, open, osascript) resolve.
+        var path = psi.Environment.TryGetValue("PATH", out var p) ? p ?? "" : "";
+        foreach (var dir in new[] { "/usr/bin", "/bin", "/usr/sbin", "/sbin" })
+        {
+            if (!path.Split(':').Contains(dir)) path = path.Length == 0 ? dir : path + ":" + dir;
+        }
+        psi.Environment["PATH"] = path;
+        if (!psi.Environment.TryGetValue("HOME", out var home) || string.IsNullOrEmpty(home))
+            psi.Environment["HOME"] = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var cert = Path.Combine(baseDir, "runtime", "cacert.pem");
         if (File.Exists(cert))
         {
             psi.Environment["SSL_CERT_FILE"] = cert;
             psi.Environment["REQUESTS_CA_BUNDLE"] = cert;
         }
-        _backend = Process.Start(psi) ?? throw new InvalidOperationException("Could not start the dashboard runtime.");
-        _backend.ErrorDataReceived += (_, args) =>
-        {
-            if (!string.IsNullOrEmpty(args.Data)) Log(args.Data);
-        };
-        _backend.BeginErrorReadLine();
 
-        string? port = null;
-        string? token = null;
-        var deadline = DateTime.UtcNow.AddSeconds(20);
-        while ((port == null || token == null) && DateTime.UtcNow < deadline)
+        Log($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} starting backend: {python} -u {serve} (cwd {baseDir})");
+        var proc = Process.Start(psi) ?? throw new InvalidOperationException("Could not start the dashboard runtime.");
+        _backend = proc;
+        proc.ErrorDataReceived += (_, args) =>
         {
-            var line = await _backend.StandardOutput.ReadLineAsync();
-            if (line == null) break;
-            if (line.StartsWith("PORT ", StringComparison.Ordinal)) port = line[5..].Trim();
-            if (line.StartsWith("TOKEN ", StringComparison.Ordinal)) token = line[6..].Trim();
+            if (string.IsNullOrEmpty(args.Data)) return;
+            Log(args.Data);
+            _stderrTail.Enqueue(args.Data);
+            while (_stderrTail.Count > 12 && _stderrTail.TryDequeue(out string? _))
+            {
+            }
+        };
+        proc.BeginErrorReadLine();
+
+        var reader = Task.Run(async () =>
+        {
+            string? port = null;
+            string? token = null;
+            while (port == null || token == null)
+            {
+                var line = await proc.StandardOutput.ReadLineAsync();
+                if (line == null) break;
+                line = line.Trim();
+                if (line.StartsWith("PORT ", StringComparison.Ordinal)) port = line[5..].Trim();
+                else if (line.StartsWith("TOKEN ", StringComparison.Ordinal)) token = line[6..].Trim();
+            }
+            return (port, token);
+        });
+        var finished = await Task.WhenAny(reader, Task.Delay(timeout));
+        if (finished != reader)
+        {
+            StopBackend();
+            return new BootResult(false, "", "", $"The dashboard runtime did not report its port within {(int)timeout.TotalSeconds} s.{StderrHint()}");
         }
+        var (portText, tokenText) = await reader;
+        // Keep draining stdout so the backend never blocks on a full pipe.
         _ = Task.Run(async () =>
         {
             try
             {
-                while (await _backend.StandardOutput.ReadLineAsync() != null)
+                while (await proc.StandardOutput.ReadLineAsync() != null)
                 {
                 }
             }
@@ -204,9 +377,58 @@ internal sealed class Shell
             {
             }
         });
-        if (port == null || token == null)
-            throw new InvalidOperationException("The dashboard runtime did not start. See ~/Library/Application Support/laden-ops/serve.log.");
-        return (port, token);
+        if (portText == null || tokenText == null)
+        {
+            string code = "";
+            try
+            {
+                if (proc.WaitForExit(2000)) code = $" (exit code {proc.ExitCode})";
+            }
+            catch (Exception)
+            {
+            }
+            StopBackend();
+            return new BootResult(false, "", "", $"The dashboard runtime stopped before it was ready{code}.{StderrHint()}");
+        }
+        if (!int.TryParse(portText, out var portNum) || portNum is < 1 or > 65535 || tokenText.Length == 0)
+        {
+            StopBackend();
+            return new BootResult(false, "", "", $"The dashboard runtime sent an invalid port \"{portText}\".");
+        }
+        Log($"backend ready on 127.0.0.1:{portNum}");
+        return new BootResult(true, portNum.ToString(), tokenText, "");
+    }
+
+    private string StderrHint()
+    {
+        var lines = _stderrTail.ToArray();
+        return lines.Length == 0 ? "" : "\n\n" + string.Join("\n", lines.TakeLast(8));
+    }
+
+    private static string ErrorPage(string reason)
+    {
+        var text = System.Net.WebUtility.HtmlEncode(string.IsNullOrWhiteSpace(reason) ? "Unknown error." : reason.Trim());
+        return """
+<!doctype html><html><head><meta charset="utf-8"><title>Laden Ops</title><style>
+html,body{margin:0;height:100%;background:#101418;color:#e8edf2;font:14px -apple-system,BlinkMacSystemFont,"Helvetica Neue",sans-serif}
+main{box-sizing:border-box;height:100%;padding:48px 44px;display:flex;flex-direction:column;gap:14px}
+h1{margin:0;font-size:20px;font-weight:600}
+pre{margin:0;padding:14px;background:#1a2027;border-radius:10px;white-space:pre-wrap;word-break:break-word;font:12px ui-monospace,Menlo,monospace;max-height:50vh;overflow:auto}
+.row{display:flex;gap:10px}
+button{font:inherit;padding:8px 18px;border-radius:8px;border:1px solid #3a4652;background:#24303b;color:#e8edf2;cursor:pointer}
+button.primary{background:#2f6fdf;border-color:#2f6fdf}
+small{color:#9aa7b4}
+</style></head><body><main>
+<h1>Laden Ops could not start its dashboard</h1>
+<pre>
+""" + text + """
+</pre>
+<small>Details are in ~/Library/Application Support/laden-ops/serve.log</small>
+<div class="row"><button class="primary" onclick="send('laden:retry')">Try again</button><button onclick="send('laden:quit')">Quit</button></div>
+</main><script>
+function send(m){try{window.external.sendMessage(m)}catch(e){}}
+</script></body></html>
+""";
     }
 
     private async Task ControlLoop(CancellationToken cancel)
@@ -253,10 +475,7 @@ internal sealed class Shell
         catch (Exception)
         {
         }
-        if (_backend is { HasExited: false })
-        {
-            try { _backend.Kill(entireProcessTree: true); } catch (Exception) { }
-        }
+        StopBackend();
     }
 
     private void WatchShortcutFile()
@@ -313,7 +532,14 @@ internal sealed class Shell
 
     private static int OnHotKey(IntPtr next, IntPtr evt, IntPtr user)
     {
-        Program.Current?.Toggle();
+        try
+        {
+            Program.Current?.Toggle();
+        }
+        catch (Exception ex)
+        {
+            Program.Current?.LogLine("hotkey: " + ex.Message);
+        }
         return 0;
     }
 
@@ -329,30 +555,113 @@ internal sealed class Shell
         _pendingShow = false;
     }
 
+    // Hide/show the whole app ([NSApp hide:] / [NSApp unhide:]) instead of
+    // ordering the only window out. Photino's AppDelegate answers YES to
+    // applicationShouldTerminateAfterLastWindowClosed:, so AppKit ended the run
+    // loop shortly after orderOut: of the last visible window and the app quit.
     private static void ShowWindow()
     {
         var app = SharedApp();
+        if (app == IntPtr.Zero) return;
+        if (SendBool(app, Sel("isHidden")))
+            Send(app, Sel("unhide:"), IntPtr.Zero);
         var win = MainWindow(app);
-        if (win == IntPtr.Zero) return;
-        if (SendBool(win, Sel("isMiniaturized")))
-            Send(win, Sel("deminiaturize:"), IntPtr.Zero);
-        Send(win, Sel("makeKeyAndOrderFront:"), IntPtr.Zero);
+        if (win != IntPtr.Zero)
+        {
+            if (SendBool(win, Sel("isMiniaturized")))
+                Send(win, Sel("deminiaturize:"), IntPtr.Zero);
+            Send(win, Sel("makeKeyAndOrderFront:"), IntPtr.Zero);
+        }
         SendBoolArg(app, Sel("activateIgnoringOtherApps:"), 1);
     }
 
     private static void HideWindow()
     {
-        var win = MainWindow(SharedApp());
-        if (win == IntPtr.Zero) return;
-        Send(win, Sel("orderOut:"), IntPtr.Zero);
+        var app = SharedApp();
+        if (app == IntPtr.Zero) return;
+        Send(app, Sel("hide:"), IntPtr.Zero);
     }
 
+    // "Hidden" for the toggle: app hidden, window not on screen, minimized, or
+    // the app is not frontmost (then Ctrl+` brings it forward instead of hiding).
     private static bool IsHidden()
     {
-        var win = MainWindow(SharedApp());
+        var app = SharedApp();
+        if (app == IntPtr.Zero) return true;
+        if (SendBool(app, Sel("isHidden"))) return true;
+        if (!SendBool(app, Sel("isActive"))) return true;
+        var win = MainWindow(app);
         if (win == IntPtr.Zero) return true;
         if (SendBool(win, Sel("isMiniaturized"))) return true;
         return !SendBool(win, Sel("isVisible"));
+    }
+
+    private static void RememberWindow()
+    {
+        if (_nsWindow != IntPtr.Zero) return;
+        var app = SharedApp();
+        var wins = app == IntPtr.Zero ? IntPtr.Zero : SendId(app, Sel("windows"));
+        if (wins != IntPtr.Zero && SendULong(wins, Sel("count")) > 0)
+            _nsWindow = SendIndex(wins, Sel("objectAtIndex:"), 0);
+    }
+
+    // Keep the app alive when its window is hidden or closed while the board is
+    // up; quit only via the board's Quit, Cmd+Q, or from the error page.
+    private static void InstallLifecycle()
+    {
+        try
+        {
+            var app = SharedApp();
+            var del = SendId(app, Sel("delegate"));
+            if (del != IntPtr.Zero)
+            {
+                var cls = object_getClass(del);
+                class_replaceMethod(cls, Sel("applicationShouldTerminateAfterLastWindowClosed:"),
+                    Marshal.GetFunctionPointerForDelegate(TerminateAfterLastThunk), "c@:@");
+            }
+            var win = _nsWindow != IntPtr.Zero ? _nsWindow : MainWindow(app);
+            var wdel = win == IntPtr.Zero ? IntPtr.Zero : SendId(win, Sel("delegate"));
+            if (wdel != IntPtr.Zero)
+            {
+                class_replaceMethod(object_getClass(wdel), Sel("windowShouldClose:"),
+                    Marshal.GetFunctionPointerForDelegate(ShouldCloseThunk), "c@:@");
+            }
+        }
+        catch (Exception ex)
+        {
+            Program.Current?.Log("lifecycle: " + ex.Message);
+        }
+    }
+
+    internal bool KeepAlive => !_quitting && _backendOk;
+
+    private static byte OnShouldTerminateAfterLastWindowClosed(IntPtr self, IntPtr cmd, IntPtr sender)
+    {
+        try
+        {
+            return Program.Current is { KeepAlive: true } ? (byte)0 : (byte)1;
+        }
+        catch (Exception)
+        {
+            return 0;
+        }
+    }
+
+    // Close button / performClose: hides while the board is up.
+    private static byte OnWindowShouldClose(IntPtr self, IntPtr cmd, IntPtr sender)
+    {
+        try
+        {
+            if (Program.Current is { KeepAlive: true })
+            {
+                HideWindow();
+                return 0;
+            }
+        }
+        catch (Exception)
+        {
+        }
+        return 1;
     }
 
     // WKWebView ignores app-region, and a drag started after the HTTP round trip
@@ -424,8 +733,14 @@ internal sealed class Shell
 
     private static void OnDrag(IntPtr self, IntPtr cmd, IntPtr evt)
     {
-        var window = SendId(self, Sel("window"));
-        if (window != IntPtr.Zero) Send(window, Sel("performWindowDragWithEvent:"), evt);
+        try
+        {
+            var window = SendId(self, Sel("window"));
+            if (window != IntPtr.Zero) Send(window, Sel("performWindowDragWithEvent:"), evt);
+        }
+        catch (Exception)
+        {
+        }
     }
 
     private static byte OnAcceptFirstMouse(IntPtr self, IntPtr cmd, IntPtr evt) => 1;
@@ -480,7 +795,13 @@ internal sealed class Shell
 
     private static byte OnReopen(IntPtr self, IntPtr cmd, IntPtr app, byte hasVisible)
     {
-        ShowWindow();
+        try
+        {
+            ShowWindow();
+        }
+        catch (Exception)
+        {
+        }
         return 1;
     }
 
@@ -614,22 +935,92 @@ internal sealed class Shell
         }
     }
 
+    // dispatch_get_main_queue() is a macro for &_dispatch_main_q; it is not an
+    // exported function on any macOS. Resolve the data symbol once instead.
+    private static IntPtr _mainQueue;
+
+    private static IntPtr MainQueue()
+    {
+        if (_mainQueue != IntPtr.Zero) return _mainQueue;
+        var lib = NativeLibrary.Load(LibSystem);
+        _mainQueue = NativeLibrary.GetExport(lib, "_dispatch_main_q");
+        return _mainQueue;
+    }
+
+    internal static Action<Action>? TestDispatcher = null;
+
     private static void OnMain(Action action)
     {
-        var handle = GCHandle.Alloc(action);
-        dispatch_async_f(dispatch_get_main_queue(), GCHandle.ToIntPtr(handle), Marshal.GetFunctionPointerForDelegate(MainThunk));
+        if (TestDispatcher != null)
+        {
+            TestDispatcher(() => RunSafely(action));
+            return;
+        }
+        try
+        {
+            if (pthread_main_np() == 1)
+            {
+                RunSafely(action);
+                return;
+            }
+            var handle = GCHandle.Alloc(action);
+            try
+            {
+                dispatch_async_f(MainQueue(), GCHandle.ToIntPtr(handle), Marshal.GetFunctionPointerForDelegate(MainThunk));
+            }
+            catch
+            {
+                handle.Free();
+                throw;
+            }
+        }
+        catch (Exception ex)
+        {
+            Program.Current?.LogLine("main-thread dispatch failed: " + ex.Message);
+            try
+            {
+                Program.Current?.InvokeViaPhotino(action);
+            }
+            catch (Exception)
+            {
+            }
+        }
+    }
+
+    internal void InvokeViaPhotino(Action action)
+    {
+        if (_window != null && !_quitting) _window.Invoke(() => RunSafely(action));
+    }
+
+    private static void RunSafely(Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception ex)
+        {
+            Program.Current?.LogLine("main-thread action: " + ex);
+        }
     }
 
     private static void OnMainThunk(IntPtr ctx)
     {
-        var handle = GCHandle.FromIntPtr(ctx);
         try
         {
-            if (handle.Target is Action action) action();
+            var handle = GCHandle.FromIntPtr(ctx);
+            try
+            {
+                if (handle.Target is Action action) RunSafely(action);
+            }
+            finally
+            {
+                handle.Free();
+            }
         }
-        finally
+        catch (Exception)
         {
-            handle.Free();
+            // Never let an exception unwind into libdispatch.
         }
     }
 
@@ -637,6 +1028,7 @@ internal sealed class Shell
 
     private static IntPtr MainWindow(IntPtr app)
     {
+        if (_nsWindow != IntPtr.Zero) return _nsWindow;
         if (app == IntPtr.Zero) return IntPtr.Zero;
         var win = SendId(app, Sel("keyWindow"));
         if (win != IntPtr.Zero) return win;
@@ -677,6 +1069,7 @@ internal sealed class Shell
 
     private delegate int CarbonHandler(IntPtr next, IntPtr evt, IntPtr user);
     private delegate byte ReopenHandler(IntPtr self, IntPtr cmd, IntPtr app, byte hasVisible);
+    private delegate byte BoolIdHandler(IntPtr self, IntPtr cmd, IntPtr arg);
     private delegate void DispatchFn(IntPtr ctx);
     private delegate void DragHandler(IntPtr self, IntPtr cmd, IntPtr evt);
     private delegate byte AcceptHandler(IntPtr self, IntPtr cmd, IntPtr evt);
@@ -709,6 +1102,9 @@ internal sealed class Shell
 
     [DllImport(ObjC, EntryPoint = "class_addMethod")]
     private static extern byte class_addMethod(IntPtr cls, IntPtr sel, IntPtr imp, string types);
+
+    [DllImport(ObjC, EntryPoint = "class_replaceMethod")]
+    private static extern IntPtr class_replaceMethod(IntPtr cls, IntPtr sel, IntPtr imp, string types);
 
     [DllImport(ObjC, EntryPoint = "objc_msgSend")]
     private static extern IntPtr objc_msgSend(IntPtr recv, IntPtr sel);
@@ -752,17 +1148,19 @@ internal sealed class Shell
     [DllImport(ObjC, EntryPoint = "objc_registerClassPair")]
     private static extern void objc_registerClassPair(IntPtr cls);
 
-    [DllImport("/usr/lib/libSystem.B.dylib")]
-    private static extern IntPtr dispatch_get_main_queue();
+    private const string LibSystem = "/usr/lib/libSystem.B.dylib";
 
-    [DllImport("/usr/lib/libSystem.B.dylib")]
+    [DllImport(LibSystem, EntryPoint = "dispatch_async_f")]
     private static extern void dispatch_async_f(IntPtr queue, IntPtr context, IntPtr work);
+
+    [DllImport(LibSystem, EntryPoint = "pthread_main_np")]
+    private static extern int pthread_main_np();
 
     [DllImport(Carbon)]
     private static extern IntPtr GetApplicationEventTarget();
 
     [DllImport(Carbon)]
-    private static extern int InstallEventHandler(IntPtr target, CarbonHandler handler, uint count, EventTypeSpec[] types, IntPtr user, out IntPtr installed);
+    private static extern int InstallEventHandler(IntPtr target, CarbonHandler handler, nuint count, EventTypeSpec[] types, IntPtr user, out IntPtr installed);
 
     [DllImport(Carbon)]
     private static extern int RegisterEventHotKey(uint keyCode, uint modifiers, EventHotKeyId id, IntPtr target, uint options, out IntPtr hotKey);

@@ -261,8 +261,65 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, json.dumps(result).encode("utf-8"), "application/json")
 
 
+def parent_watchdog(parent_pid: int, interval: float = 2.0, getppid=None, alive=None, stop=None) -> None:
+    """Exit when the shell that started us is gone (crash, SIGKILL, force quit).
+
+    POSIX only. Checks every `interval` seconds: our parent pid changed (we were
+    reparented to launchd/init, pid 1) or the parent pid no longer exists.
+    """
+    import os
+    import time
+
+    getppid = getppid or os.getppid
+
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)  # signal 0: existence check only
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    alive = alive or _alive
+    stop = stop or (lambda: os._exit(0))
+    while True:
+        time.sleep(interval)
+        ppid = getppid()
+        if ppid == 1 or ppid != parent_pid or not alive(parent_pid):
+            stop()
+            return
+
+
+def start_parent_watchdog() -> bool:
+    """Start the watchdog when the shell passed LADEN_PARENT_PID (macOS shell)."""
+    import os
+
+    raw = os.environ.get("LADEN_PARENT_PID", "")
+    # Never on Windows: os.kill() there terminates the target process.
+    if os.name != "posix" or not raw.isdigit() or int(raw) <= 1:
+        return False
+    threading.Thread(target=parent_watchdog, args=(int(raw),), name="ldash-parent-watchdog", daemon=True).start()
+    return True
+
+
+def warm_host_sensors() -> None:
+    """Probe the temperature sensors in the background before the UI asks."""
+    if sys.platform != "darwin":
+        return
+    try:
+        from machost import warm_sensors
+
+        warm_sensors()
+        HOST._sensors_warmed = True
+    except Exception:
+        pass
+
+
 def main() -> None:
     mimetypes.add_type("text/css", ".css")
+    start_parent_watchdog()
+    warm_host_sensors()
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
     port = server.server_address[1]

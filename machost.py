@@ -33,13 +33,12 @@ def sample_system(host: object) -> dict:
         load1, load5, load15 = os.getloadavg()
     except OSError:
         load1 = load5 = load15 = 0.0
-    now = time.time()
-    cpu_temp, gpu_pct, gpu_temp = getattr(host, "_temps", (None, None, None))
-    if now - float(getattr(host, "_gpu_at", 0.0)) > 3:
-        cpu_temp, gpu_pct, gpu_temp = _sample_temps_and_gpu()
-        host._temps = (cpu_temp, gpu_pct, gpu_temp)
-        host._gpu = (gpu_pct, gpu_temp)
-        host._gpu_at = now
+    # Same path as _sample_temps_and_gpu(): it caches for a couple of seconds
+    # and holds the last good reading across transient sensor misses.
+    cpu_temp, gpu_pct, gpu_temp = _sample_temps_and_gpu()
+    host._temps = (cpu_temp, gpu_pct, gpu_temp)
+    host._gpu = (gpu_pct, gpu_temp)
+    host._gpu_at = time.time()
     return {
         "ok": True,
         "hostname": os.uname().nodename,
@@ -687,26 +686,47 @@ class _HIDReader:
 
 
 class MacSensors:
-    """Probe once, cache the method that works, and keep values None otherwise."""
+    """Probe once, cache the method that works, and keep readings steady.
+
+    - Reads are serialized: a second caller waits for the read in flight
+      instead of getting None back.
+    - Each call retries the cached method a few times before giving up.
+    - A transient miss returns the last good value for HOLD_S seconds.
+    - A hung native call drops the method; it is re-probed later, a few times.
+    """
 
     TIMEOUT_S = 2.0
     MAX_FAILS = 3
+    HOLD_S = 10.0
+    RETRIES = 3
+    RETRY_DELAY_S = 0.05
+    REPROBE_AFTER_S = 60.0
+    MAX_PROBES = 5
 
-    def __init__(self, machine: str | None = None, hid_factory=None, smc_factory=None, runner=None, ioreg: str | None = "/usr/sbin/ioreg") -> None:
+    def __init__(self, machine: str | None = None, hid_factory=None, smc_factory=None, runner=None,
+                 ioreg: str | None = "/usr/sbin/ioreg", clock=None, sleep=None) -> None:
         self.machine = (machine if machine is not None else _safe_machine()).lower()
         self._hid_factory = hid_factory or _HIDReader
         self._smc_factory = smc_factory or _SMCReader
         self._run = runner or subprocess.check_output
         self._ioreg = ioreg
+        self._clock = clock or time.monotonic
+        self._sleep = sleep or time.sleep
         self._lock = _threading.Lock()
+        self._read_lock = _threading.Lock()
         self._probed = False
+        self._probing = False
+        self._probes = 0
+        self._next_probe_at = 0.0
         self.method = "none"
         self.reader = None
         self.smc_cpu_key: str | None = None
         self.smc_gpu_key: str | None = None
+        self._expect = {"cpu": False, "gpu": False}
         self._fails = 0
-        self._busy = False
+        self._last: dict[str, tuple[float | None, float]] = {"cpu": (None, 0.0), "gpu": (None, 0.0), "util": (None, 0.0)}
         self._util_ok = True
+        self._util_seen = False
         self._util_fails = 0
 
     @property
@@ -724,6 +744,8 @@ class MacSensors:
         if cpu is None and gpu is None:
             return False
         self.method, self.reader = "iohid", reader
+        self._expect = {"cpu": cpu is not None, "gpu": gpu is not None}
+        self._seed(cpu, gpu)
         return True
 
     def _try_smc(self) -> bool:
@@ -737,7 +759,7 @@ class MacSensors:
         done, picked = _call_with_timeout(find, self.TIMEOUT_S * 2)
         if not done or not picked:
             return False
-        (cpu_key, _cpu), (gpu_key, _gpu) = picked
+        (cpu_key, cpu_val), (gpu_key, gpu_val) = picked
         if cpu_key is None and gpu_key is None:
             try:
                 reader.close()
@@ -746,10 +768,14 @@ class MacSensors:
             return False
         self.method, self.reader = "smc", reader
         self.smc_cpu_key, self.smc_gpu_key = cpu_key, gpu_key
+        self._expect = {"cpu": cpu_key is not None, "gpu": gpu_key is not None}
+        self._seed(cpu_val, gpu_val)
         return True
 
     def probe(self) -> str:
         self._probed = True
+        self._probes += 1
+        self._next_probe_at = self._clock() + self.REPROBE_AFTER_S
         self.method, self.reader = "none", None
         order = (self._try_hid, self._try_smc) if self.apple_silicon else (self._try_smc, self._try_hid)
         for attempt in order:
@@ -758,6 +784,7 @@ class MacSensors:
                     break
             except Exception:
                 continue
+        self._fails = 0
         return self.method
 
     def _read_once(self) -> tuple[float | None, float | None]:
@@ -769,52 +796,113 @@ class MacSensors:
             return _valid_temp(cpu), _valid_temp(gpu)
         return None, None
 
-    def temps(self) -> tuple[float | None, float | None]:
-        """(cpuTempC, gpuTempC)."""
+    def _seed(self, cpu: float | None, gpu: float | None) -> None:
+        """The probe's own readings count as good values (no cold null after it)."""
         with self._lock:
-            if not self._probed:
+            for kind, value in (("cpu", _valid_temp(cpu)), ("gpu", _valid_temp(gpu))):
+                if value is not None:
+                    self._last[kind] = (value, self._clock())
+
+    def _hold(self, kind: str, value: float | None) -> float | None:
+        """Remember a good value, or return the last good one for HOLD_S seconds."""
+        now = self._clock()
+        if value is not None:
+            self._last[kind] = (value, now)
+            return value
+        last, at = self._last[kind]
+        if last is not None and now - at <= self.HOLD_S:
+            return last
+        return None
+
+    def _held(self, cpu: float | None, gpu: float | None) -> tuple[float | None, float | None]:
+        with self._lock:
+            return self._hold("cpu", cpu), self._hold("gpu", gpu)
+
+    def _wants_probe(self) -> bool:
+        if not self._probed:
+            return True
+        return (self.method == "none" and self._probes < self.MAX_PROBES
+                and self._clock() >= self._next_probe_at)
+
+    def _read_with_retry(self) -> tuple[float | None, float | None]:
+        cpu = gpu = None
+        for attempt in range(self.RETRIES):
+            if self.method == "none":
+                break
+            done, value = _call_with_timeout(self._read_once, self.TIMEOUT_S)
+            if not done:
+                # A native call hung. Stop using this method instead of piling up
+                # threads; a later call re-probes after REPROBE_AFTER_S.
+                self.method = "none"
+                self._next_probe_at = self._clock() + self.REPROBE_AFTER_S
+                break
+            if value:
+                if cpu is None:
+                    cpu = _valid_temp(value[0])
+                if gpu is None:
+                    gpu = _valid_temp(value[1])
+            if (cpu is not None or not self._expect["cpu"]) and (gpu is not None or not self._expect["gpu"]):
+                break
+            if attempt + 1 < self.RETRIES:
+                self._sleep(self.RETRY_DELAY_S)
+        if cpu is None and gpu is None and self.method != "none":
+            self._fails += 1
+            if self._fails >= self.MAX_FAILS * 10:
+                # Long dead streak: probe again (maybe another key/sensor works now).
+                self.method = "none"
+                self._next_probe_at = self._clock()
+        elif cpu is not None or gpu is not None:
+            self._fails = 0
+        return cpu, gpu
+
+    def temps(self) -> tuple[float | None, float | None]:
+        """(cpuTempC, gpuTempC), steady across transient misses."""
+        with self._lock:
+            probing_elsewhere = self._probing
+        if probing_elsewhere:
+            # The first probe can take a few seconds; never block an HTTP call on it.
+            return self._held(None, None)
+        if not self._read_lock.acquire(timeout=self.TIMEOUT_S * (self.RETRIES + 1)):
+            return self._held(None, None)
+        try:
+            if self._wants_probe():
+                with self._lock:
+                    self._probing = True
                 try:
                     self.probe()
                 except Exception:
                     self.method = "none"
-            if self.method == "none" or self._busy:
-                return None, None
-            self._busy = True
-        try:
-            done, value = _call_with_timeout(self._read_once, self.TIMEOUT_S)
+                finally:
+                    with self._lock:
+                        self._probing = False
+            cpu, gpu = self._read_with_retry()
         finally:
-            with self._lock:
-                self._busy = False
-        if not done:
-            # A native call hung. Stop using this method instead of piling up threads.
-            with self._lock:
-                self.method = "none"
-            return None, None
-        if not value or (value[0] is None and value[1] is None):
-            with self._lock:
-                self._fails += 1
-                if self._fails >= self.MAX_FAILS * 10:
-                    self.method = "none"
-            return None, None
-        with self._lock:
-            self._fails = 0
-        return value
+            self._read_lock.release()
+        return self._held(cpu, gpu)
+
+    def _ioreg_util(self) -> float | None:
+        try:
+            out = self._run([self._ioreg, "-r", "-c", "IOAccelerator", "-d", "1"], text=True, timeout=2, stderr=subprocess.DEVNULL)
+            return parse_ioreg_gpu_util(out)
+        except Exception:
+            return None
 
     def gpu_util(self) -> float | None:
         if not self._util_ok or not self._ioreg:
             return None
-        try:
-            out = self._run([self._ioreg, "-r", "-c", "IOAccelerator", "-d", "1"], text=True, timeout=2, stderr=subprocess.DEVNULL)
-            util = parse_ioreg_gpu_util(out)
-        except Exception:
-            util = None
+        util = self._ioreg_util()
         if util is None:
-            self._util_fails += 1
-            if self._util_fails >= self.MAX_FAILS:
-                self._util_ok = False
-        else:
-            self._util_fails = 0
-        return util
+            util = self._ioreg_util()  # one quick retry
+        with self._lock:
+            if util is None:
+                self._util_fails += 1
+                # Only give up on a Mac where ioreg never reported a value.
+                if not self._util_seen and self._util_fails >= self.MAX_FAILS:
+                    self._util_ok = False
+            else:
+                self._util_seen = True
+                self._util_fails = 0
+            return self._hold("util", util)
 
     def sources(self) -> dict:
         cpu = self.method
@@ -834,25 +922,53 @@ def _safe_machine() -> str:
 
 
 _MAC_SENSORS: MacSensors | None = None
+_MAC_SENSORS_LOCK = _threading.Lock()
 
 
 def _mac_sensors() -> MacSensors:
     global _MAC_SENSORS
-    if _MAC_SENSORS is None:
-        _MAC_SENSORS = MacSensors()
-    return _MAC_SENSORS
+    with _MAC_SENSORS_LOCK:
+        if _MAC_SENSORS is None:
+            _MAC_SENSORS = MacSensors()
+        return _MAC_SENSORS
 
 
-def warm_sensors() -> None:
-    """Start the one-time probe in the background so the first sample is quick."""
+_WARM_STARTED = False
+
+
+def _warm() -> None:
+    sensors = _mac_sensors()
     try:
-        _threading.Thread(target=lambda: _mac_sensors().temps(), name="ldash-sensor-probe", daemon=True).start()
+        sensors.temps()
+    except Exception:
+        pass
+    try:
+        sensors.gpu_util()
     except Exception:
         pass
 
 
-def _sample_temps_and_gpu() -> tuple[float | None, float | None, float | None]:
-    """(cpuTempC, gpuPct, gpuTempC). nvidia-smi still wins if someone has it."""
+def warm_sensors() -> None:
+    """Start the one-time probe in the background (once) so the first sample has values.
+
+    serve.py calls this at backend start-up, before the window opens."""
+    global _WARM_STARTED
+    with _MAC_SENSORS_LOCK:
+        if _WARM_STARTED:
+            return
+        _WARM_STARTED = True
+    try:
+        _threading.Thread(target=_warm, name="ldash-sensor-probe", daemon=True).start()
+    except Exception:
+        pass
+
+
+SAMPLE_MAX_AGE_S = 2.0
+_SAMPLE_LOCK = _threading.Lock()
+_SAMPLE: dict = {"at": None, "value": (None, None, None)}
+
+
+def _sample_temps_and_gpu_uncached() -> tuple[float | None, float | None, float | None]:
     sensors = _mac_sensors()
     try:
         cpu, gpu_temp = sensors.temps()
@@ -870,6 +986,24 @@ def _sample_temps_and_gpu() -> tuple[float | None, float | None, float | None]:
     if n_temp is not None:
         gpu_temp = n_temp
     return cpu, gpu_pct, gpu_temp
+
+
+def _sample_temps_and_gpu() -> tuple[float | None, float | None, float | None]:
+    """(cpuTempC, gpuPct, gpuTempC). nvidia-smi still wins if someone has it.
+
+    The single sampling path for the Mac: sample_system() calls this too.
+    Concurrent callers share one sample taken at most SAMPLE_MAX_AGE_S ago.
+    """
+    with _SAMPLE_LOCK:
+        now = time.monotonic()
+        at = _SAMPLE["at"]
+        if at is not None and now - at < SAMPLE_MAX_AGE_S:
+            return _SAMPLE["value"]
+        value = _sample_temps_and_gpu_uncached()
+        if value[0] is not None or value[2] is not None:
+            _SAMPLE["at"] = time.monotonic()
+            _SAMPLE["value"] = value
+        return value
 
 
 def _nvidia() -> tuple[float | None, float | None]:
